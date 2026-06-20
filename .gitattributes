@@ -1,1 +1,2 @@
 C:/Users/richa/ShelfObjectDetection/models/efficientnet/efficientnet_best.keras filter=lfs diff=lfs merge=lfs -text
+C:/Users/richa/ShelfObjectDetection/models/yolo/best.pt filter=lfs diff=lfs merge=lfs -text
