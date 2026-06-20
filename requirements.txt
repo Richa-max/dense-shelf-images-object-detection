@@ -1,0 +1,13 @@
+gradio
+ultralytics
+torch
+torchvision
+transformers
+accelerate
+pillow
+opencv-python-headless
+tensorflow
+numpy
+pandas
+requests
+Flask
