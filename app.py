@@ -1,21 +1,15 @@
-import gradio as gr
 import os
-import torch
+
+import gradio as gr
 from PIL import Image, ImageDraw
 from ultralytics import YOLO
-from transformers import LlavaForConditionalGeneration, AutoProcessor
+
+from efficientnet_model import classify_pil_image, load_model_if_needed
+from llava4_model import generate_llava4_answer
+
 
 yolo_model = YOLO("models/yolo/best.pt")
 
-llava_model_id = "llava-hf/llava-1.5-7b-hf"
-
-processor = AutoProcessor.from_pretrained(llava_model_id)
-
-llava_model = LlavaForConditionalGeneration.from_pretrained(
-    llava_model_id,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
 
 def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
     x1 = max(0, int(x1 - pad))
@@ -24,31 +18,59 @@ def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
     y2 = min(img_h, int(y2 + pad))
     return x1, y1, x2, y2
 
-def classify_crop_with_llava(crop):
-    prompt = """
-USER: <image>
-Identify the retail product category in this crop.
-Return only one category name, such as beverage, snack, dairy, personal care, household, packaged food, etc.
-ASSISTANT:
-"""
 
-    inputs = processor(
-        text=prompt,
-        images=crop,
-        return_tensors="pt"
-    ).to(llava_model.device)
+def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_grained: bool = False) -> dict:
+    top1 = float(pred.get("confidence", 0.0))
+    gap = float(pred.get("confidence_gap", 0.0))
 
-    output = llava_model.generate(
-        **inputs,
-        max_new_tokens=30
-    )
+    if fine_grained:
+        return {
+            "action": "call_llava_now",
+            "reason": "user_requested_fine_grained",
+            "should_call_llava4": True,
+        }
 
-    answer = processor.decode(output[0], skip_special_tokens=True)
-    return answer.split("ASSISTANT:")[-1].strip()
+    if user_requested_llava:
+        return {
+            "action": "call_llava_now",
+            "reason": "user_requested_llava4",
+            "should_call_llava4": True,
+        }
 
-def process_image(input_image):
+    if top1 >= 0.80 and gap >= 0.20:
+        return {
+            "action": "accept_efficientnet",
+            "reason": "high_confidence_and_clear_margin",
+            "should_call_llava4": False,
+        }
+
+    if top1 >= 0.60 and gap < 0.20:
+        return {
+            "action": "defer_to_user",
+            "reason": "uncertain_small_margin",
+            "should_call_llava4": False,
+        }
+
+    if 0.60 <= top1 < 0.80:
+        return {
+            "action": "defer_to_user",
+            "reason": "medium_confidence",
+            "should_call_llava4": False,
+        }
+
+    return {
+        "action": "call_llava_now",
+        "reason": "low_confidence",
+        "should_call_llava4": True,
+    }
+
+
+def process_image(input_image, routing_mode, force_llava, disable_llava, llava_prompt):
     image = input_image.convert("RGB")
     img_w, img_h = image.size
+
+    # Preload EfficientNet once.
+    load_model_if_needed()
 
     results = yolo_model(image, conf=0.25)
     boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -57,39 +79,85 @@ def process_image(input_image):
     draw = ImageDraw.Draw(annotated)
 
     rows = []
+    fine_grained = routing_mode == "fine_grained"
 
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box[:4]
-
-        px1, py1, px2, py2 = pad_box(
-            x1, y1, x2, y2,
-            img_w, img_h,
-            pad=12
-        )
+        px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w, img_h, pad=12)
 
         crop = image.crop((px1, py1, px2, py2))
+        efficientnet_pred = classify_pil_image(crop)
 
-        category = classify_crop_with_llava(crop)
+        routing = decide_backend_action(
+            efficientnet_pred,
+            user_requested_llava=bool(force_llava),
+            fine_grained=fine_grained,
+        )
+
+        llava4_result = None
+        final_category = efficientnet_pred.get("label") or "unknown"
+
+        if routing["should_call_llava4"] and not disable_llava:
+            try:
+                llava4_result = generate_llava4_answer(
+                    image=crop,
+                    broad_category=efficientnet_pred.get("label"),
+                    user_prompt=(llava_prompt or None),
+                )
+                llava_answer = (llava4_result or {}).get("answer", "").strip()
+                if llava_answer:
+                    final_category = llava_answer
+            except Exception as llava_exc:
+                llava4_result = {
+                    "error": "llava4_failed",
+                    "details": str(llava_exc),
+                }
+        elif routing["should_call_llava4"] and disable_llava:
+            llava4_result = {
+                "status": "skipped",
+                "reason": "disable_llava=true",
+            }
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
-        draw.text((px1, py1 - 10), category, fill="red")
+        draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
 
-        rows.append({
-            "crop_id": i + 1,
-            "category": category,
-            "box": [px1, py1, px2, py2]
-        })
+        rows.append(
+            {
+                "crop_id": i + 1,
+                "box": [px1, py1, px2, py2],
+                "final_category": final_category,
+                "efficientnet": efficientnet_pred,
+                "routing": routing,
+                "llava4": llava4_result,
+            }
+        )
 
     return annotated, rows
 
+
 demo = gr.Interface(
     fn=process_image,
-    inputs=gr.Image(type="pil", label="Upload shelf image"),
+    inputs=[
+        gr.Image(type="pil", label="Upload shelf image"),
+        gr.Radio(
+            choices=["coarse", "fine_grained"],
+            value="coarse",
+            label="Routing mode",
+            info="coarse = confidence-based routing, fine_grained = always call LLaVA4",
+        ),
+        gr.Checkbox(value=False, label="Force LLaVA4"),
+        gr.Checkbox(value=False, label="Disable LLaVA4"),
+        gr.Textbox(
+            lines=4,
+            label="Optional LLaVA prompt override",
+            placeholder="Leave empty to use default prompt",
+        ),
+    ],
     outputs=[
         gr.Image(type="pil", label="Annotated image"),
-        gr.JSON(label="Detected product categories")
+        gr.JSON(label="Per-crop routing and predictions"),
     ],
-    title="Retail Product Detection + LLaVA Category Prediction"
+    title="Retail Product Detection + EfficientNet -> LLaVA4 Routing",
 )
 
 demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
