@@ -3,7 +3,20 @@ from flask import Flask, request, jsonify
 from PIL import Image
 
 from efficientnet_model import classify_pil_image, load_model_if_needed
+from clip_model import classify_with_clip_pil
 from llava4_model import generate_llava4_answer
+import json
+import os
+
+# load default subcategories mapping if present
+_SUBCATS = {}
+_SC_PATH = os.path.join(os.path.dirname(__file__), "subcategories.json")
+if os.path.exists(_SC_PATH):
+    try:
+        with open(_SC_PATH, "r", encoding="utf-8") as fh:
+            _SUBCATS = json.load(fh)
+    except Exception:
+        _SUBCATS = {}
 
 
 app = Flask(__name__)
@@ -83,6 +96,28 @@ def classify_crop():
     fine_grained = _to_bool(request.form.get("fine_grained"))
     disable_llava = _to_bool(request.form.get("disable_llava"))
     llava_prompt = request.form.get("llava_prompt")
+    # CLIP subcategory options: either provide a JSON list in 'subcategories'
+    # or send newline-separated values. Also accepts boolean 'use_clip'.
+    raw_subcats = request.form.get("subcategories")
+    use_clip = _to_bool(request.form.get("use_clip")) or bool(raw_subcats)
+    subcategories = None
+    if raw_subcats:
+        raw = raw_subcats.strip()
+        try:
+            import json
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                subcategories = [str(x) for x in parsed]
+        except Exception:
+            # fallback: newline or comma separated
+            if "\n" in raw:
+                subcategories = [s.strip() for s in raw.splitlines() if s.strip()]
+            else:
+                subcategories = [s.strip() for s in raw.split(",") if s.strip()]
+
+        # if user didn't provide explicit subcategories but we have a default mapping,
+        # and a broad category was predicted by EfficientNet, use those candidates.
 
     try:
         # ensure model is loaded first (raises helpful error if not found)
@@ -94,24 +129,45 @@ def classify_crop():
             fine_grained=fine_grained,
         )
 
-        llava4_result = None
-        if routing["should_call_llava4"] and not disable_llava:
+        # populate subcategories from default mapping when not provided
+        if use_clip and not subcategories:
+            broad = result.get("label")
+            if broad and broad in _SUBCATS:
+                subcategories = _SUBCATS.get(broad)
+
+        # Optionally run CLIP to resolve a fine-grained subcategory from candidates.
+        clip_result = None
+        if use_clip and subcategories:
             try:
-                llava4_result = generate_llava4_answer(
-                    image=img,
-                    broad_category=result.get("label"),
-                    user_prompt=llava_prompt,
-                )
-            except Exception as llava_exc:
+                clip_result = classify_with_clip_pil(img, subcategories)
+            except Exception as clip_exc:
+                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+
+        llava4_result = None
+        # If CLIP returned a confident subcategory, accept it and skip LLaVA4.
+        clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
+        if clip_label and clip_label != "unknown":
+            # CLIP resolved the subcategory; don't call LLaVA4.
+            llava4_result = {"status": "skipped", "reason": "clip_resolved", "clip": clip_result}
+        else:
+            # Either CLIP wasn't used, failed, or returned unknown — follow existing routing for LLaVA4.
+            if routing["should_call_llava4"] and not disable_llava:
+                try:
+                    llava4_result = generate_llava4_answer(
+                        image=img,
+                        broad_category=result.get("label"),
+                        user_prompt=llava_prompt,
+                    )
+                except Exception as llava_exc:
+                    llava4_result = {
+                        "error": "llava4_failed",
+                        "details": str(llava_exc),
+                    }
+            elif routing["should_call_llava4"] and disable_llava:
                 llava4_result = {
-                    "error": "llava4_failed",
-                    "details": str(llava_exc),
+                    "status": "skipped",
+                    "reason": "disable_llava=true",
                 }
-        elif routing["should_call_llava4"] and disable_llava:
-            llava4_result = {
-                "status": "skipped",
-                "reason": "disable_llava=true",
-            }
     except Exception as e:
         return jsonify({"error": "inference failed", "details": str(e)}), 500
 
@@ -119,6 +175,7 @@ def classify_crop():
         {
             "efficientnet": result,
             "routing": routing,
+            "clip": clip_result,
             "llava4": llava4_result,
         }
     )

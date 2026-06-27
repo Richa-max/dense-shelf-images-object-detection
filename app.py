@@ -5,6 +5,19 @@ from PIL import Image, ImageDraw
 from ultralytics import YOLO
 
 from efficientnet_model import classify_pil_image, load_model_if_needed
+from clip_model import classify_with_clip_pil
+import json
+import os
+
+# load default subcategories mapping if present
+_SUBCATS = {}
+_SC_PATH = os.path.join(os.path.dirname(__file__), "subcategories.json")
+if os.path.exists(_SC_PATH):
+    try:
+        with open(_SC_PATH, "r", encoding="utf-8") as fh:
+            _SUBCATS = json.load(fh)
+    except Exception:
+        _SUBCATS = {}
 from llava4_model import generate_llava4_answer
 
 
@@ -65,7 +78,7 @@ def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_g
     }
 
 
-def process_image(input_image, routing_mode, force_llava, disable_llava, llava_prompt):
+def process_image(input_image, routing_mode, force_llava, disable_llava, llava_prompt, use_clip=False, subcategories_text=None):
     image = input_image.convert("RGB")
     img_w, img_h = image.size
 
@@ -80,6 +93,21 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
 
     rows = []
     fine_grained = routing_mode == "fine_grained"
+    use_clip = bool(use_clip)
+    subcategories = None
+    if subcategories_text:
+        raw = subcategories_text.strip()
+        try:
+            import json
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                subcategories = [str(x) for x in parsed]
+        except Exception:
+            if "\n" in raw:
+                subcategories = [s.strip() for s in raw.splitlines() if s.strip()]
+            else:
+                subcategories = [s.strip() for s in raw.split(",") if s.strip()]
 
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box[:4]
@@ -95,28 +123,49 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
         )
 
         llava4_result = None
+        clip_result = None
         final_category = efficientnet_pred.get("label") or "unknown"
 
-        if routing["should_call_llava4"] and not disable_llava:
+        # Attempt CLIP subcategory resolution if requested and candidates provided.
+        if use_clip and subcategories:
             try:
-                llava4_result = generate_llava4_answer(
-                    image=crop,
-                    broad_category=efficientnet_pred.get("label"),
-                    user_prompt=(llava_prompt or None),
-                )
-                llava_answer = (llava4_result or {}).get("answer", "").strip()
-                if llava_answer:
-                    final_category = llava_answer
-            except Exception as llava_exc:
+                clip_result = classify_with_clip_pil(crop, subcategories)
+            except Exception as clip_exc:
+                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+        elif use_clip and not subcategories:
+            # try to use default mapping for this broad category
+            broad = efficientnet_pred.get("label")
+            if broad and broad in _SUBCATS:
+                try:
+                    clip_result = classify_with_clip_pil(crop, _SUBCATS.get(broad))
+                except Exception as clip_exc:
+                    clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+
+        # If CLIP found a confident subcategory, accept it and skip LLaVA4.
+        if isinstance(clip_result, dict) and clip_result.get("label") and clip_result.get("label") != "unknown":
+            final_category = clip_result.get("label")
+            llava4_result = {"status": "skipped", "reason": "clip_resolved", "clip": clip_result}
+        else:
+            if routing["should_call_llava4"] and not disable_llava:
+                try:
+                    llava4_result = generate_llava4_answer(
+                        image=crop,
+                        broad_category=efficientnet_pred.get("label"),
+                        user_prompt=(llava_prompt or None),
+                    )
+                    llava_answer = (llava4_result or {}).get("answer", "").strip()
+                    if llava_answer:
+                        final_category = llava_answer
+                except Exception as llava_exc:
+                    llava4_result = {
+                        "error": "llava4_failed",
+                        "details": str(llava_exc),
+                    }
+            elif routing["should_call_llava4"] and disable_llava:
                 llava4_result = {
-                    "error": "llava4_failed",
-                    "details": str(llava_exc),
+                    "status": "skipped",
+                    "reason": "disable_llava=true",
                 }
-        elif routing["should_call_llava4"] and disable_llava:
-            llava4_result = {
-                "status": "skipped",
-                "reason": "disable_llava=true",
-            }
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
@@ -152,6 +201,8 @@ demo = gr.Interface(
             label="Optional LLaVA prompt override",
             placeholder="Leave empty to use default prompt",
         ),
+        gr.Checkbox(value=False, label="Use CLIP for subcategory resolution"),
+        gr.Textbox(lines=6, label="Subcategories (one per line or JSON list)", placeholder="e.g.\nBeverages\nSnacks\nDairy"),
     ],
     outputs=[
         gr.Image(type="pil", label="Annotated image"),
