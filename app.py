@@ -205,8 +205,6 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
                     "status": "skipped",
                     "reason": "disable_llava=true",
                 }
-                    "reason": "disable_llava=true",
-                }
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
