@@ -11,3 +11,12 @@ numpy
 pandas
 requests
 Flask
+accelerate
+bitsandbytes
+sentencepiece
+protobuf
+safetensors
+huggingface_hub
+peft
+einops
+timm

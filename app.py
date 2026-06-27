@@ -5,8 +5,9 @@ from PIL import Image, ImageDraw
 from ultralytics import YOLO
 
 from efficientnet_model import classify_pil_image, load_model_if_needed
-from clip_model import classify_with_clip_pil
+from clip_model import classify_with_clip_pil, load_clip_if_needed
 import json
+import time
 import os
 
 # load default subcategories mapping if present
@@ -22,6 +23,15 @@ from llava4_model import generate_llava4_answer
 
 
 yolo_model = YOLO("models/yolo/best.pt")
+
+# Preload heavier models at startup to avoid first-request latency.
+try:
+    load_model_if_needed()
+    if os.getenv("PRELOAD_CLIP", "0").strip().lower() in {"1", "true", "yes"}:
+        load_clip_if_needed()
+except Exception:
+    # model loading may happen on-demand; don't crash the app if preload fails
+    pass
 
 
 def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
@@ -79,6 +89,7 @@ def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_g
 
 
 def process_image(input_image, routing_mode, force_llava, disable_llava, llava_prompt, use_clip=False, subcategories_text=None):
+    t0 = time.time()
     image = input_image.convert("RGB")
     img_w, img_h = image.size
 
@@ -86,6 +97,8 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
     load_model_if_needed()
 
     results = yolo_model(image, conf=0.25)
+    t_yolo = time.time()
+    print(f"[timing] YOLO inference took {t_yolo - t0:.3f}s")
     boxes = results[0].boxes.xyxy.cpu().numpy()
 
     annotated = image.copy()
@@ -114,6 +127,7 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
         px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w, img_h, pad=12)
 
         crop = image.crop((px1, py1, px2, py2))
+        t_before_eff = time.time()
         efficientnet_pred = classify_pil_image(crop)
 
         routing = decide_backend_action(
@@ -126,33 +140,58 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
         clip_result = None
         final_category = efficientnet_pred.get("label") or "unknown"
 
-        # Attempt CLIP subcategory resolution if requested and candidates provided.
-        if use_clip and subcategories:
-            try:
-                clip_result = classify_with_clip_pil(crop, subcategories)
-            except Exception as clip_exc:
-                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
-        elif use_clip and not subcategories:
-            # try to use default mapping for this broad category
+        # If EfficientNet couldn't produce a clear broad category, force CLIP resolution.
+        eff_label = (efficientnet_pred.get("label") or "").strip()
+        eff_unknown = (not eff_label) or eff_label.lower() in {"unknown", "other / unclear", "other", "unclear"}
+
+        # Prepare CLIP candidates: prefer explicit subcategories, then mapping for the predicted broad category,
+        # otherwise fall back to flattened mapping of all subcategories.
+        clip_candidates = None
+        if subcategories:
+            clip_candidates = subcategories
+        else:
             broad = efficientnet_pred.get("label")
             if broad and broad in _SUBCATS:
-                try:
-                    clip_result = classify_with_clip_pil(crop, _SUBCATS.get(broad))
-                except Exception as clip_exc:
-                    clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+                clip_candidates = _SUBCATS.get(broad)
+            else:
+                # flatten default mapping as a fallback (may be large)
+                all_cands = []
+                for v in _SUBCATS.values():
+                    all_cands.extend(v)
+                clip_candidates = all_cands if all_cands else None
 
-        # If CLIP found a confident subcategory, accept it and skip LLaVA4.
-        if isinstance(clip_result, dict) and clip_result.get("label") and clip_result.get("label") != "unknown":
-            final_category = clip_result.get("label")
+        # Only run CLIP when requested by UI or when EfficientNet is unknown.
+        run_clip = use_clip or eff_unknown
+        if run_clip and clip_candidates:
+            try:
+                t_before_clip = time.time()
+                clip_result = classify_with_clip_pil(crop, clip_candidates)
+                t_clip = time.time()
+                print(f"[timing] crop {i} CLIP took {t_clip - t_before_clip:.3f}s")
+            except Exception as clip_exc:
+                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+
+        # If CLIP provided a confident label, accept it. Otherwise, fall back to LLaVA4 when routing allows.
+        clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
+        clip_score = float((clip_result or {}).get("score") or 0.0) if isinstance(clip_result, dict) else 0.0
+        clip_low_confidence = clip_label in (None, "unknown") or clip_score < 0.18
+
+        if clip_label and clip_label != "unknown":
+            final_category = clip_label
             llava4_result = {"status": "skipped", "reason": "clip_resolved", "clip": clip_result}
         else:
-            if routing["should_call_llava4"] and not disable_llava:
+            # If EfficientNet unknown and CLIP low-confidence, prefer calling LLaVA4.
+            should_force_llava = eff_unknown and (clip_result is None or clip_low_confidence)
+            if (routing["should_call_llava4"] or should_force_llava) and not disable_llava:
                 try:
+                    t_before_llava = time.time()
                     llava4_result = generate_llava4_answer(
                         image=crop,
                         broad_category=efficientnet_pred.get("label"),
                         user_prompt=(llava_prompt or None),
                     )
+                    t_llava = time.time()
+                    print(f"[timing] crop {i} LLaVA4 took {t_llava - t_before_llava:.3f}s")
                     llava_answer = (llava4_result or {}).get("answer", "").strip()
                     if llava_answer:
                         final_category = llava_answer
@@ -161,9 +200,11 @@ def process_image(input_image, routing_mode, force_llava, disable_llava, llava_p
                         "error": "llava4_failed",
                         "details": str(llava_exc),
                     }
-            elif routing["should_call_llava4"] and disable_llava:
+            elif (routing["should_call_llava4"] or should_force_llava) and disable_llava:
                 llava4_result = {
                     "status": "skipped",
+                    "reason": "disable_llava=true",
+                }
                     "reason": "disable_llava=true",
                 }
 

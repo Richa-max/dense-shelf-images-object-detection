@@ -3,7 +3,8 @@ from flask import Flask, request, jsonify
 from PIL import Image
 
 from efficientnet_model import classify_pil_image, load_model_if_needed
-from clip_model import classify_with_clip_pil
+from clip_model import classify_with_clip_pil, load_clip_if_needed
+import time
 from llava4_model import generate_llava4_answer
 import json
 import os
@@ -20,6 +21,14 @@ if os.path.exists(_SC_PATH):
 
 
 app = Flask(__name__)
+
+# Preload models at startup if requested via env var to avoid first-request stalls.
+try:
+    load_model_if_needed()
+    if os.getenv("PRELOAD_CLIP", "0").strip().lower() in {"1", "true", "yes"}:
+        load_clip_if_needed()
+except Exception:
+    pass
 
 
 def _to_bool(value) -> bool:
@@ -122,7 +131,10 @@ def classify_crop():
     try:
         # ensure model is loaded first (raises helpful error if not found)
         load_model_if_needed()
+        t0 = time.time()
         result = classify_pil_image(img)
+        t_eff = time.time()
+        print(f"[timing] EfficientNet inference took {t_eff - t0:.3f}s")
         routing = decide_backend_action(
             result,
             user_requested_llava=user_requested_llava,
@@ -139,7 +151,10 @@ def classify_crop():
         clip_result = None
         if use_clip and subcategories:
             try:
+                t_before_clip = time.time()
                 clip_result = classify_with_clip_pil(img, subcategories)
+                t_clip = time.time()
+                print(f"[timing] CLIP inference took {t_clip - t_before_clip:.3f}s")
             except Exception as clip_exc:
                 clip_result = {"error": "clip_failed", "details": str(clip_exc)}
 
@@ -153,11 +168,14 @@ def classify_crop():
             # Either CLIP wasn't used, failed, or returned unknown — follow existing routing for LLaVA4.
             if routing["should_call_llava4"] and not disable_llava:
                 try:
-                    llava4_result = generate_llava4_answer(
-                        image=img,
-                        broad_category=result.get("label"),
-                        user_prompt=llava_prompt,
-                    )
+                        t_before_llava = time.time()
+                        llava4_result = generate_llava4_answer(
+                            image=img,
+                            broad_category=result.get("label"),
+                            user_prompt=llava_prompt,
+                        )
+                        t_llava = time.time()
+                        print(f"[timing] LLaVA4 inference took {t_llava - t_before_llava:.3f}s")
                 except Exception as llava_exc:
                     llava4_result = {
                         "error": "llava4_failed",
