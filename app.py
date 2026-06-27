@@ -4,6 +4,7 @@ import gradio as gr
 from PIL import Image, ImageDraw
 import io
 import base64
+import numpy as np
 from ultralytics import YOLO
 
 from efficientnet_model import classify_pil_image, load_model_if_needed
@@ -40,6 +41,27 @@ def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
     x2 = min(img_w, int(x2 + pad))
     y2 = min(img_h, int(y2 + pad))
     return x1, y1, x2, y2
+
+
+def estimate_empty_space(boxes, img_w, img_h, max_dim=640):
+    if len(boxes) == 0:
+        return 1.0, 0.0
+
+    scale = max(1, max(img_w, img_h) // max_dim)
+    h = max(1, img_h // scale)
+    w = max(1, img_w // scale)
+    mask = np.zeros((h, w), dtype=bool)
+    for box in boxes:
+        x1, y1, x2, y2 = [int(round(v / scale)) for v in box[:4]]
+        x1 = max(0, min(x1, w))
+        x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h))
+        y2 = max(0, min(y2, h))
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = True
+    covered = float(mask.sum())
+    coverage = covered / (w * h)
+    return 1.0 - coverage, coverage
 
 
 def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_grained: bool = False) -> dict:
@@ -88,7 +110,7 @@ def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_g
     }
 
 
-def process_image(input_image):
+def process_image(input_image, question):
     t0 = time.time()
     image = input_image.convert("RGB")
     img_w, img_h = image.size
@@ -109,6 +131,9 @@ def process_image(input_image):
     all_clip_candidates = []
     for v in _SUBCATS.values():
         all_clip_candidates.extend(v)
+
+    empty_ratio, covered_ratio = estimate_empty_space(boxes, img_w, img_h)
+    empty_label = "High" if empty_ratio >= 0.55 else "Moderate" if empty_ratio >= 0.25 else "Low"
 
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box[:4]
@@ -178,16 +203,64 @@ def process_image(input_image):
 
     # Build synthesized summary (user-friendly)
     unique_cats = {}
+    unknown_items = []
     for r in rows:
         cat = r.get("product_category") or "unknown"
         unique_cats[cat] = unique_cats.get(cat, 0) + 1
+        if cat.lower() == "unknown":
+            unknown_items.append(r["crop_id"])
+
     # Summarize counts and build simple HTML (no hover/tooltips)
     summary_lines = []
-    num_distinct = len(unique_cats)
-    total_items = sum(unique_cats.values())
-    summary_lines.append(f"<p><b>Number of distinct product categories detected:</b> {num_distinct}</p>")
-    summary_lines.append(f"<p><b>Total product crops detected:</b> {total_items}</p>")
-    summary_lines.append("<h3>Detected product categories</h3>")
+    total_items = len(rows)
+    num_distinct = len([c for c in unique_cats.keys() if c.lower() != "unknown"])
+    summary_lines.append("<h3>Store Management Summary</h3>")
+    summary_lines.append(f"<p><b>1. How many products were detected on this shelf?</b> {total_items}</p>")
+
+    # Top categories by count
+    if unique_cats:
+        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
+        top_categories = [f"{cat} ({cnt})" for cat, cnt in sorted_cats if cat.lower() != "unknown"]
+        if not top_categories:
+            top_categories = ["Unknown"]
+        summary_lines.append(f"<p><b>2. Top detected categories by count:</b> {', '.join(top_categories[:5])}</p>")
+    else:
+        summary_lines.append("<p><b>2. Top detected categories by count:</b> none</p>")
+
+    # Manual review flag
+    if unknown_items:
+        summary_lines.append(f"<p><b>3. Items needing manual review:</b> Unknown products at crop IDs {', '.join(map(str, unknown_items))}</p>")
+    else:
+        summary_lines.append("<p><b>3. Items needing manual review:</b> none detected</p>")
+
+    # Mixed vs category-specific
+    distinct_categories = len([cat for cat in unique_cats.keys() if cat.lower() != "unknown"])
+    if distinct_categories == 0:
+        shelf_type = "Unknown"
+    elif distinct_categories == 1:
+        shelf_type = "Category-specific"
+    else:
+        shelf_type = "Mixed"
+    summary_lines.append(f"<p><b>4. Shelf type:</b> {shelf_type}</p>")
+
+    # Empty space estimate
+    summary_lines.append(
+        f"<p><b>5. Estimated visible empty space:</b> {empty_ratio*100:.0f}% ({empty_label}) based on YOLO bounding boxes.</p>"
+    )
+
+    question_answers = {
+        "How many products were detected on this shelf?": f"{total_items}",
+        "Which are the top detected categories by count?": ", ".join(top_categories[:5]) if unique_cats else "None",
+        "Which items need manual review?": (
+            f"Unknown products at crop IDs {', '.join(map(str, unknown_items))}"
+            if unknown_items
+            else "None detected"
+        ),
+        "Is this shelf mixed or category-specific?": shelf_type,
+        "How much empty space is visible on this shelf?": f"{empty_ratio*100:.0f}% ({empty_label})",
+    }
+
+    summary_lines.append("<h4>Detected categories</h4>")
     if unique_cats:
         summary_lines.append("<ul>")
         for cat, cnt in sorted(unique_cats.items(), key=lambda x: -x[1]):
@@ -209,21 +282,34 @@ def process_image(input_image):
 
     summary_html = "\n".join(summary_lines)
 
-    # Return the annotated PIL image directly (no hover areas) and the HTML summary
-    return annotated, summary_html
+    selected_answer = question_answers.get(question, "Please upload an image and select a question.")
+    answer_html = f"<p><b>{question}</b><br>{selected_answer}</p>"
+    return annotated, summary_html, answer_html
 
 
 demo = gr.Interface(
     fn=process_image,
     inputs=[
         gr.Image(type="pil", label="Upload shelf image"),
+        gr.Dropdown(
+            choices=[
+                "How many products were detected on this shelf?",
+                "Which are the top detected categories by count?",
+                "Which items need manual review?",
+                "Is this shelf mixed or category-specific?",
+                "How much empty space is visible on this shelf?",
+            ],
+            value="How many products were detected on this shelf?",
+            label="Select a Store Management question",
+        ),
     ],
     outputs=[
         gr.Image(type="pil", label="Annotated image"),
         gr.HTML(label="Summary"),
+        gr.HTML(label="Selected question answer"),
     ],
     title="Smart Shelf Management Dashboard",
-    description="Upload a shelf image to detect product categories and subcategories in a friendly summary.",
+    description="Upload a shelf image to detect product categories and subcategories and answer key store management questions.",
 )
 
 if __name__ == "__main__":
