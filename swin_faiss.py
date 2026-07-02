@@ -56,24 +56,42 @@ class SwinFaissClassifier:
         return self.is_ready_flag
 
     def _load_resources(self):
+        # Provide clear debugging/logging for why resources may not load.
         if faiss is None:
+            print("[swin_faiss] faiss not installed or not importable (faiss=None)")
+            self.is_ready_flag = False
             return
 
         try:
-            if not os.path.exists(self.model_dir) or not os.path.exists(self.processor_dir):
-                return
+            missing = []
+            if not os.path.exists(self.model_dir):
+                missing.append(self.model_dir)
+            if not os.path.exists(self.processor_dir):
+                missing.append(self.processor_dir)
             if not os.path.exists(self.index_path):
+                missing.append(self.index_path)
+
+            if missing:
+                print(f"[swin_faiss] missing resource paths: {missing}")
+                self.is_ready_flag = False
                 return
 
+            print(f"[swin_faiss] loading processor from: {self.processor_dir}")
             self.processor = AutoImageProcessor.from_pretrained(self.processor_dir)
+            print(f"[swin_faiss] loading model from: {self.model_dir}")
             self.model = AutoModel.from_pretrained(self.model_dir)
             self.model.eval()
             self.model.to(self.device)
 
+            print(f"[swin_faiss] reading FAISS index from: {self.index_path}")
             self.index = faiss.read_index(self.index_path)
             self.image_paths = self._load_paths()
+            if not self.image_paths:
+                print("[swin_faiss] loaded FAISS index but no image paths were found")
             self.is_ready_flag = bool(self.index is not None and self.image_paths)
-        except Exception:
+            print(f"[swin_faiss] is_ready set to {self.is_ready_flag}")
+        except Exception as exc:
+            print(f"[swin_faiss] failed to load resources: {exc}")
             self.is_ready_flag = False
 
     def _load_paths(self):
