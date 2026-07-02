@@ -1,9 +1,10 @@
 import io
 from flask import Flask, request, jsonify
 from PIL import Image
+from ultralytics import YOLO
 
-from efficientnet_model import classify_pil_image, load_model_if_needed
 from clip_model import classify_with_clip_pil, load_clip_if_needed
+from swin_faiss import load_swin_faiss_classifier
 import time
 from llava4_model import generate_llava4_answer
 import json
@@ -22,9 +23,11 @@ if os.path.exists(_SC_PATH):
 
 app = Flask(__name__)
 
-# Preload models at startup if requested via env var to avoid first-request stalls.
+yolo_model = YOLO("models/yolo/best.pt")
+swin_classifier = load_swin_faiss_classifier()
+
+# Preload CLIP at startup if requested via env var to avoid first-request stalls.
 try:
-    load_model_if_needed()
     if os.getenv("PRELOAD_CLIP", "0").strip().lower() in {"1", "true", "yes"}:
         load_clip_if_needed()
 except Exception:
@@ -37,50 +40,58 @@ def _to_bool(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_grained: bool = False) -> dict:
-    """Apply the EfficientNet->LLaVA4 routing policy provided by product rules."""
-    top1 = float(pred.get("confidence", 0.0))
-    gap = float(pred.get("confidence_gap", 0.0))
+def pad_box(x1, y1, x2, y2, img_w, img_h, pad=12):
+    x1 = max(0, int(x1 - pad))
+    y1 = max(0, int(y1 - pad))
+    x2 = min(img_w, int(x2 + pad))
+    y2 = min(img_h, int(y2 + pad))
+    return x1, y1, x2, y2
 
-    if fine_grained:
-        return {
-            "action": "call_llava_now",
-            "reason": "user_requested_fine_grained",
-            "should_call_llava4": True,
-        }
 
-    if user_requested_llava:
-        return {
-            "action": "call_llava_now",
-            "reason": "user_requested_llava4",
-            "should_call_llava4": True,
-        }
+def _classify_crop_image(img: Image.Image, disable_llava: bool = False, llava_prompt: str = None) -> dict:
+    if not swin_classifier.is_ready():
+        raise RuntimeError("Swin FAISS classifier is not ready")
 
-    if top1 >= 0.80 and gap >= 0.20:
-        return {
-            "action": "accept_efficientnet",
-            "reason": "high_confidence_and_clear_margin",
-            "should_call_llava4": False,
-        }
+    swin_result = swin_classifier.classify(img, top_k=10, top_labels=5)
+    result_label = "unknown"
+    clip_result = None
+    if swin_result.get("confidence") == "high":
+        result_label = swin_result.get("label", "unknown")
+    else:
+        candidate_labels = swin_result.get("candidate_labels", [])
+        if candidate_labels:
+            try:
+                clip_result = classify_with_clip_pil(img, candidate_labels)
+                clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
+                clip_score = float((clip_result or {}).get("score") or 0.0)
+                if clip_label and clip_label != "unknown" and clip_score >= 0.18:
+                    result_label = clip_label
+            except Exception as clip_exc:
+                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+        else:
+            clip_result = {"label": "unknown", "score": 0.0, "all": {}}
 
-    if top1 >= 0.60 and gap < 0.20:
-        return {
-            "action": "defer_to_user",
-            "reason": "uncertain_small_margin",
-            "should_call_llava4": False,
-        }
-
-    if 0.60 <= top1 < 0.80:
-        return {
-            "action": "defer_to_user",
-            "reason": "medium_confidence",
-            "should_call_llava4": False,
-        }
+    llava4_result = None
+    if not disable_llava and result_label != "unknown":
+        try:
+            llava4_result = generate_llava4_answer(
+                image=img,
+                broad_category=result_label,
+                user_prompt=llava_prompt,
+            )
+        except Exception as llava_exc:
+            llava4_result = {
+                "error": "llava4_failed",
+                "details": str(llava_exc),
+            }
+    elif disable_llava:
+        llava4_result = {"status": "skipped", "reason": "disable_llava=true"}
 
     return {
-        "action": "call_llava_now",
-        "reason": "low_confidence",
-        "should_call_llava4": True,
+        "category": result_label,
+        "swin": swin_result,
+        "clip": clip_result,
+        "llava4": llava4_result,
     }
 
 
@@ -128,75 +139,107 @@ def classify_crop():
         # if user didn't provide explicit subcategories but we have a default mapping,
         # and a broad category was predicted by EfficientNet, use those candidates.
 
+    if not swin_classifier.is_ready():
+        return jsonify({"error": "swin_classifier_not_ready"}), 503
+
     try:
-        # ensure model is loaded first (raises helpful error if not found)
-        load_model_if_needed()
         t0 = time.time()
-        result = classify_pil_image(img)
-        t_eff = time.time()
-        print(f"[timing] EfficientNet inference took {t_eff - t0:.3f}s")
-        routing = decide_backend_action(
-            result,
-            user_requested_llava=user_requested_llava,
-            fine_grained=fine_grained,
-        )
+        swin_result = swin_classifier.classify(img, top_k=10, top_labels=5)
+        t_swin = time.time()
+        print(f"[timing] SWIN inference took {t_swin - t0:.3f}s")
 
-        # populate subcategories from default mapping when not provided
-        if use_clip and not subcategories:
-            broad = result.get("label")
-            if broad and broad in _SUBCATS:
-                subcategories = _SUBCATS.get(broad)
-
-        # Optionally run CLIP to resolve a fine-grained subcategory from candidates.
+        result_label = "unknown"
         clip_result = None
-        if use_clip and subcategories:
-            try:
-                t_before_clip = time.time()
-                clip_result = classify_with_clip_pil(img, subcategories)
-                t_clip = time.time()
-                print(f"[timing] CLIP inference took {t_clip - t_before_clip:.3f}s")
-            except Exception as clip_exc:
-                clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+        if swin_result.get("confidence") == "high":
+            result_label = swin_result.get("label", "unknown")
+        else:
+            candidate_labels = swin_result.get("candidate_labels", [])
+            if candidate_labels:
+                try:
+                    t_before_clip = time.time()
+                    clip_result = classify_with_clip_pil(img, candidate_labels)
+                    t_clip = time.time()
+                    print(f"[timing] CLIP inference took {t_clip - t_before_clip:.3f}s")
+                    clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
+                    clip_score = float((clip_result or {}).get("score") or 0.0)
+                    if clip_label and clip_label != "unknown" and clip_score >= 0.18:
+                        result_label = clip_label
+                except Exception as clip_exc:
+                    clip_result = {"error": "clip_failed", "details": str(clip_exc)}
+            else:
+                clip_result = {"label": "unknown", "score": 0.0, "all": {}}
 
         llava4_result = None
-        # If CLIP returned a confident subcategory, accept it and skip LLaVA4.
-        clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
-        if clip_label and clip_label != "unknown":
-            # CLIP resolved the subcategory; don't call LLaVA4.
-            llava4_result = {"status": "skipped", "reason": "clip_resolved", "clip": clip_result}
-        else:
-            # Either CLIP wasn't used, failed, or returned unknown — follow existing routing for LLaVA4.
-            if routing["should_call_llava4"] and not disable_llava:
-                try:
-                        t_before_llava = time.time()
-                        llava4_result = generate_llava4_answer(
-                            image=img,
-                            broad_category=result.get("label"),
-                            user_prompt=llava_prompt,
-                        )
-                        t_llava = time.time()
-                        print(f"[timing] LLaVA4 inference took {t_llava - t_before_llava:.3f}s")
-                except Exception as llava_exc:
-                    llava4_result = {
-                        "error": "llava4_failed",
-                        "details": str(llava_exc),
-                    }
-            elif routing["should_call_llava4"] and disable_llava:
+        if not disable_llava and result_label != "unknown":
+            try:
+                t_before_llava = time.time()
+                llava4_result = generate_llava4_answer(
+                    image=img,
+                    broad_category=result_label,
+                    user_prompt=llava_prompt,
+                )
+                t_llava = time.time()
+                print(f"[timing] LLaVA4 inference took {t_llava - t_before_llava:.3f}s")
+            except Exception as llava_exc:
                 llava4_result = {
-                    "status": "skipped",
-                    "reason": "disable_llava=true",
+                    "error": "llava4_failed",
+                    "details": str(llava_exc),
                 }
+        elif disable_llava:
+            llava4_result = {"status": "skipped", "reason": "disable_llava=true"}
     except Exception as e:
         return jsonify({"error": "inference failed", "details": str(e)}), 500
 
     return jsonify(
         {
-            "efficientnet": result,
-            "routing": routing,
+            "category": result_label,
+            "swin": swin_result,
             "clip": clip_result,
             "llava4": llava4_result,
         }
     )
+
+
+@app.route("/classify_shelf", methods=["POST"])
+def classify_shelf():
+    if "image" not in request.files:
+        return jsonify({"error": "no image file provided (form key 'image')"}), 400
+
+    file = request.files["image"]
+    try:
+        img = Image.open(io.BytesIO(file.read()))
+    except Exception as e:
+        return jsonify({"error": "cannot open image", "details": str(e)}), 400
+
+    disable_llava = _to_bool(request.form.get("disable_llava"))
+    llava_prompt = request.form.get("llava_prompt")
+
+    if not swin_classifier.is_ready():
+        return jsonify({"error": "swin_classifier_not_ready"}), 503
+
+    try:
+        yolo_results = yolo_model(img, conf=0.25)
+        boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+        items = []
+        for idx, box in enumerate(boxes, start=1):
+            x1, y1, x2, y2 = [int(v) for v in box[:4]]
+            px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img.width, img.height)
+            crop = img.crop((px1, py1, px2, py2))
+            classification = _classify_crop_image(crop, disable_llava=disable_llava, llava_prompt=llava_prompt)
+            items.append(
+                {
+                    "crop_id": idx,
+                    "box": [px1, py1, px2, py2],
+                    "category": classification["category"],
+                    "swin": classification["swin"],
+                    "clip": classification["clip"],
+                    "llava4": classification["llava4"],
+                }
+            )
+    except Exception as e:
+        return jsonify({"error": "inference_failed", "details": str(e)}), 500
+
+    return jsonify({"items": items, "count": len(items)})
 
 
 if __name__ == "__main__":

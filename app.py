@@ -7,8 +7,8 @@ import base64
 import numpy as np
 from ultralytics import YOLO
 
-from efficientnet_model import classify_pil_image, load_model_if_needed
 from clip_model import classify_with_clip_pil
+from swin_faiss import load_swin_faiss_classifier
 import json
 import time
 import os
@@ -26,14 +26,7 @@ from llava4_model import generate_llava4_answer
 
 
 yolo_model = YOLO("models/yolo/best.pt")
-
-# Preload the EfficientNet model at startup to avoid first-request latency.
-try:
-    load_model_if_needed()
-except Exception:
-    # model loading may happen on-demand; don't crash the app if preload fails
-    pass
-
+swin_classifier = load_swin_faiss_classifier()
 
 def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
     x1 = max(0, int(x1 - pad))
@@ -115,9 +108,6 @@ def process_image(input_image, question):
     image = input_image.convert("RGB")
     img_w, img_h = image.size
 
-    # Preload EfficientNet once.
-    load_model_if_needed()
-
     results = yolo_model(image, conf=0.25)
     t_yolo = time.time()
     print(f"[timing] YOLO inference took {t_yolo - t0:.3f}s")
@@ -127,11 +117,6 @@ def process_image(input_image, question):
     draw = ImageDraw.Draw(annotated)
 
     rows = []
-    # Flatten default mapping candidates for CLIP fallback when EfficientNet is uncertain.
-    all_clip_candidates = []
-    for v in _SUBCATS.values():
-        all_clip_candidates.extend(v)
-
     empty_ratio, covered_ratio = estimate_empty_space(boxes, img_w, img_h)
     empty_label = "High" if empty_ratio >= 0.55 else "Moderate" if empty_ratio >= 0.25 else "Low"
 
@@ -140,51 +125,65 @@ def process_image(input_image, question):
         px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w, img_h, pad=12)
 
         crop = image.crop((px1, py1, px2, py2))
-        t_before_eff = time.time()
-        efficientnet_pred = classify_pil_image(crop)
-
-        efficientnet_category = efficientnet_pred.get("label") or "unknown"
-        eff_label = efficientnet_category.strip()
-        eff_unknown = (not eff_label) or eff_label.lower() in {"unknown", "other / unclear", "other", "unclear"}
-
+        t_before_swin = time.time()
+        swin_result = None
+        final_category = "unknown"
         clip_result = None
-        final_category = efficientnet_category
+        unknown_path = None
 
-        # If EfficientNet is unclear, try CLIP fallback on default mapped candidates.
-        if eff_unknown and all_clip_candidates:
+        if swin_classifier.is_ready():
             try:
-                t_before_clip = time.time()
-                clip_result = classify_with_clip_pil(crop, all_clip_candidates)
-                t_clip = time.time()
-                print(f"[timing] crop {i} CLIP took {t_clip - t_before_clip:.3f}s")
-                clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
-                if clip_label and clip_label != "unknown":
-                    final_category = clip_label
+                swin_result = swin_classifier.classify(crop, top_k=10, top_labels=5)
+                t_swin = time.time()
+                print(f"[timing] crop {i} Swin FAISS took {t_swin - t_before_swin:.3f}s")
+                if swin_result["confidence"] == "high":
+                    final_category = swin_result["label"]
                 else:
-                    final_category = "unknown"
-            except Exception as clip_exc:
-                print(f"[warning] crop {i} CLIP failed: {clip_exc}")
+                    candidates = swin_result.get("candidate_labels", [])
+                    if candidates:
+                        try:
+                            t_before_clip = time.time()
+                            clip_result = classify_with_clip_pil(crop, candidates)
+                            t_clip = time.time()
+                            print(f"[timing] crop {i} CLIP took {t_clip - t_before_clip:.3f}s")
+                            clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
+                            clip_score = float((clip_result or {}).get("score") or 0.0)
+                            if clip_label and clip_label != "unknown" and clip_score >= 0.18:
+                                final_category = clip_label
+                            else:
+                                final_category = "unknown"
+                        except Exception as clip_exc:
+                            print(f"[warning] crop {i} CLIP failed: {clip_exc}")
+                            final_category = "unknown"
+                    else:
+                        final_category = "unknown"
+            except Exception as swin_exc:
+                print(f"[warning] crop {i} Swin FAISS failed: {swin_exc}")
                 final_category = "unknown"
-        elif eff_unknown:
+        else:
+            print("[warning] Swin FAISS classifier not ready; marking crop as unknown")
             final_category = "unknown"
 
-        # Always generate subcategory via LLaVA4 for the detected category.
-        llava_sub_result = None
+        if final_category == "unknown":
+            unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
+
+        llava_sub_result = {"answer": None}
         subcategory_label = "unknown"
-        try:
-            t_before_sub = time.time()
-            llava_sub_result = generate_llava4_answer(
-                image=crop,
-                broad_category=final_category,
-                user_prompt=None,
-            )
-            t_sub = time.time()
-            print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
-            if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
-                subcategory_label = llava_sub_result.get("answer")
-        except Exception as sub_exc:
-            llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
-            subcategory_label = "unknown"
+        if final_category != "unknown":
+            try:
+                t_before_sub = time.time()
+                llava_sub_result = generate_llava4_answer(
+                    image=crop,
+                    broad_category=final_category,
+                    user_prompt=None,
+                )
+                t_sub = time.time()
+                print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
+                if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
+                    subcategory_label = llava_sub_result.get("answer")
+            except Exception as sub_exc:
+                llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
+                subcategory_label = "unknown"
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
@@ -195,13 +194,13 @@ def process_image(input_image, question):
                 "box": [px1, py1, px2, py2],
                 "product_category": final_category,
                 "subcategory": subcategory_label,
-                "efficientnet": efficientnet_pred,
+                "swin": swin_result,
                 "clip": clip_result,
                 "llava_subcategory": llava_sub_result,
             }
         )
 
-    # Build synthesized summary (user-friendly)
+    # Build synthesized summary in human-first language
     unique_cats = {}
     unknown_items = []
     for r in rows:
@@ -210,77 +209,83 @@ def process_image(input_image, question):
         if cat.lower() == "unknown":
             unknown_items.append(r["crop_id"])
 
-    # Summarize counts and build simple HTML (no hover/tooltips)
     summary_lines = []
     total_items = len(rows)
-    num_distinct = len([c for c in unique_cats.keys() if c.lower() != "unknown"])
-    summary_lines.append("<h3>Store Management Summary</h3>")
-    summary_lines.append(f"<p><b>1. How many products were detected on this shelf?</b> {total_items}</p>")
-
-    # Top categories by count
-    if unique_cats:
-        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
-        top_categories = [f"{cat} ({cnt})" for cat, cnt in sorted_cats if cat.lower() != "unknown"]
-        if not top_categories:
-            top_categories = ["Unknown"]
-        summary_lines.append(f"<p><b>2. Top detected categories by count:</b> {', '.join(top_categories[:5])}</p>")
-    else:
-        summary_lines.append("<p><b>2. Top detected categories by count:</b> none</p>")
-
-    # Manual review flag
-    if unknown_items:
-        summary_lines.append(f"<p><b>3. Items needing manual review:</b> Unknown products at crop IDs {', '.join(map(str, unknown_items))}</p>")
-    else:
-        summary_lines.append("<p><b>3. Items needing manual review:</b> none detected</p>")
-
-    # Mixed vs category-specific
     distinct_categories = len([cat for cat in unique_cats.keys() if cat.lower() != "unknown"])
-    if distinct_categories == 0:
-        shelf_type = "Unknown"
-    elif distinct_categories == 1:
+    shelf_type = "Unknown"
+    if distinct_categories == 1:
         shelf_type = "Category-specific"
-    else:
+    elif distinct_categories > 1:
         shelf_type = "Mixed"
-    summary_lines.append(f"<p><b>4. Shelf type:</b> {shelf_type}</p>")
 
-    # Empty space estimate
+    summary_lines.append("<h3>Store Management Summary</h3>")
     summary_lines.append(
-        f"<p><b>5. Estimated visible empty space:</b> {empty_ratio*100:.0f}% ({empty_label}) based on YOLO bounding boxes.</p>"
+        f"<p>We detected <strong>{total_items}</strong> product{'s' if total_items != 1 else ''} on this shelf. "
+        f"The shelf appears <strong>{shelf_type.lower()}</strong> with {distinct_categories} distinct category{'ies' if distinct_categories != 1 else ''}.</p>"
     )
 
-    question_answers = {
-        "How many products were detected on this shelf?": f"{total_items}",
-        "Which are the top detected categories by count?": ", ".join(top_categories[:5]) if unique_cats else "None",
-        "Which items need manual review?": (
-            f"Unknown products at crop IDs {', '.join(map(str, unknown_items))}"
-            if unknown_items
-            else "None detected"
-        ),
-        "Is this shelf mixed or category-specific?": shelf_type,
-        "How much empty space is visible on this shelf?": f"{empty_ratio*100:.0f}% ({empty_label})",
-    }
-
-    summary_lines.append("<h4>Detected categories</h4>")
     if unique_cats:
-        summary_lines.append("<ul>")
-        for cat, cnt in sorted(unique_cats.items(), key=lambda x: -x[1]):
-            summary_lines.append(f"<li><b>{cat}</b>: {cnt} item(s)</li>")
-        summary_lines.append("</ul>")
+        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
+        category_lines = []
+        for cat, cnt in sorted_cats[:5]:
+            category_lines.append(f"{cnt} x {cat}")
+        summary_lines.append(
+            f"<p><strong>Top categories:</strong> {', '.join(category_lines)}</p>"
+        )
     else:
-        summary_lines.append("<p>No products detected.</p>")
+        summary_lines.append("<p><strong>Top categories:</strong> none detected yet.</p>")
 
-    # Per-crop details
-    summary_lines.append("<h4>Crop details</h4>")
-    summary_lines.append("<ol>")
-    for r in rows:
-        cid = r["crop_id"]
-        cat = r.get("product_category") or "unknown"
-        sub = r.get("subcategory") or "unknown"
-        detail = f"Crop {cid}: <b>Product Category:</b> {cat}; <b>Product Subcategory:</b> {sub}"
-        summary_lines.append(f"<li>{detail}</li>")
-    summary_lines.append("</ol>")
+    if unknown_items:
+        summary_lines.append(
+            f"<p><strong>Manual review needed:</strong> {len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may be unclear and should be checked manually.</p>"
+        )
+    else:
+        summary_lines.append("<p><strong>Manual review needed:</strong> no unclear items were found.</p>")
+
+    summary_lines.append(
+        f"<p><strong>Estimated visible empty space:</strong> {empty_ratio*100:.0f}% ({empty_label}).</p>"
+    )
+
+    summary_lines.append("<h4>Detected items</h4>")
+    if rows:
+        summary_lines.append("<ol>")
+        for r in rows:
+            cid = r["crop_id"]
+            cat = r.get("product_category") or "unknown"
+            sub = r.get("subcategory") or "unknown"
+            if cat.lower() == "unknown":
+                summary_lines.append(
+                    f"<li>Item {cid} could not be confidently identified and should be reviewed.</li>"
+                )
+            else:
+                summary_lines.append(
+                    f"<li>Item {cid} is likely <strong>{cat}</strong> with subcategory <strong>{sub}</strong>.</li>"
+                )
+        summary_lines.append("</ol>")
+    else:
+        summary_lines.append("<p>No product items were found in the image.</p>")
 
     summary_html = "\n".join(summary_lines)
+
+    question_answers = {
+        "How many products were detected on this shelf?": (
+            f"We detected {total_items} product{'s' if total_items != 1 else ''} on the shelf."
+        ),
+        "Which are the top detected categories by count?": (
+            f"The top categories are {', '.join(category_lines)}." if unique_cats else "No clear product categories were identified."
+        ),
+        "Which items need manual review?": (
+            f"{len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may need manual review."
+            if unknown_items
+            else "No items require manual review at this time."
+        ),
+        "Is this shelf mixed or category-specific?": (
+            f"This shelf appears to be {shelf_type.lower()}."
+        ),
+        "How much empty space is visible on this shelf?": (
+            f"About {empty_ratio*100:.0f}% of the shelf appears empty ({empty_label})."
+        ),
+    }
 
     selected_answer = question_answers.get(question, "Please upload an image and select a question.")
     answer_html = f"<p><b>{question}</b><br>{selected_answer}</p>"
