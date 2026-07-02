@@ -3,3 +3,7 @@ C:/Users/richa/ShelfObjectDetection/models/yolo/best.pt filter=lfs diff=lfs merg
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.keras filter=lfs diff=lfs merge=lfs -text
 models/** filter=lfs diff=lfs merge=lfs -text
+swin_faiss_index.bin filter=lfs diff=lfs merge=lfs -text
+swin_model_assets/** filter=lfs diff=lfs merge=lfs -text
+swin_processor_assets/** filter=lfs diff=lfs merge=lfs -text
+swin_full_embeddings.npy filter=lfs diff=lfs merge=lfs -text
