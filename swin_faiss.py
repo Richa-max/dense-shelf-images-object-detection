@@ -79,31 +79,79 @@ class SwinFaissClassifier:
     def _load_paths(self):
         if os.path.exists(self.indexed_image_paths_npy):
             data = np.load(self.indexed_image_paths_npy, allow_pickle=True)
-            return [str(x) for x in data.tolist()]
+            return [
+                {
+                    "path": str(x),
+                    "label": _infer_label_from_path(str(x)),
+                    "subcategory": None,
+                }
+                for x in data.tolist()
+                if x is not None
+            ]
         if os.path.exists(self.image_paths_path):
+            entries = []
             with open(self.image_paths_path, "r", encoding="utf-8") as fh:
-                return [line.strip() for line in fh if line.strip()]
+                for line in fh:
+                    path = line.strip()
+                    if not path:
+                        continue
+                    entries.append(
+                        {
+                            "path": path,
+                            "label": _infer_label_from_path(path),
+                            "subcategory": None,
+                        }
+                    )
+            return entries
         csv_path = os.path.splitext(self.image_paths_path)[0] + ".csv"
         if os.path.exists(csv_path):
-            paths = []
+            entries = []
             try:
                 import csv
 
                 with open(csv_path, "r", encoding="utf-8", newline="") as fh:
-                    reader = csv.reader(fh)
+                    reader = csv.DictReader(fh)
                     for row in reader:
                         if not row:
                             continue
-                        value = str(row[0]).strip()
-                        if value:
-                            paths.append(value)
+                        path = str(row.get("image_path", "")).strip()
+                        if not path:
+                            continue
+                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                        if not label:
+                            label = _infer_label_from_path(path)
+                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                        entries.append(
+                            {
+                                "path": path,
+                                "label": label,
+                                "subcategory": subcategory,
+                            }
+                        )
             except Exception:
                 with open(csv_path, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        value = line.strip()
-                        if value:
-                            paths.append(value)
-            return paths
+                    lines = [line.strip() for line in fh if line.strip()]
+                    if not lines:
+                        return []
+                    headers = [h.strip() for h in lines[0].split(",")]
+                    for line in lines[1:]:
+                        values = [v.strip() for v in line.split(",")]
+                        row = dict(zip(headers, values))
+                        path = str(row.get("image_path", "")).strip()
+                        if not path:
+                            continue
+                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                        if not label:
+                            label = _infer_label_from_path(path)
+                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                        entries.append(
+                            {
+                                "path": path,
+                                "label": label,
+                                "subcategory": subcategory,
+                            }
+                        )
+            return entries
         return []
 
     def _embed_image(self, image: Image.Image) -> np.ndarray:
@@ -132,9 +180,18 @@ class SwinFaissClassifier:
         for idx, score in zip(ids, scores):
             if idx < 0 or idx >= len(self.image_paths):
                 continue
-            path = self.image_paths[idx]
-            label = _infer_label_from_path(path)
-            neighbors.append({"path": path, "label": label, "score": float(score)})
+            data = self.image_paths[idx]
+            path = data.get("path") if isinstance(data, dict) else str(data)
+            label = data.get("label") if isinstance(data, dict) else _infer_label_from_path(path)
+            subcategory = data.get("subcategory") if isinstance(data, dict) else None
+            neighbors.append(
+                {
+                    "path": path,
+                    "label": label,
+                    "subcategory": subcategory,
+                    "score": float(score),
+                }
+            )
 
         return neighbors
 

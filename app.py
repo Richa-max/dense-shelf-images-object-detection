@@ -136,6 +136,8 @@ def process_image(input_image, question):
                 swin_result = swin_classifier.classify(crop, top_k=10, top_labels=5)
                 t_swin = time.time()
                 print(f"[timing] crop {i} Swin FAISS took {t_swin - t_before_swin:.3f}s")
+                if i == 0:
+                    print(f"[debug] crop {i} swin_result={swin_result}")
                 if swin_result["confidence"] == "high":
                     final_category = swin_result["label"]
                 else:
