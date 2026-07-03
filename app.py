@@ -120,6 +120,16 @@ def process_image(input_image, question):
     empty_ratio, covered_ratio = estimate_empty_space(boxes, img_w, img_h)
     empty_label = "High" if empty_ratio >= 0.55 else "Moderate" if empty_ratio >= 0.25 else "Low"
 
+    def _looks_like_path_label(label: str) -> bool:
+        if not label:
+            return False
+        normalized = label.lower().replace("_", " ").strip()
+        if normalized.startswith("train ") or normalized.startswith("train_"):
+            return True
+        if " crop " in normalized or normalized.endswith(" crop") or normalized.startswith("crop "):
+            return True
+        return False
+
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box[:4]
         px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w, img_h, pad=12)
@@ -138,10 +148,13 @@ def process_image(input_image, question):
                 print(f"[timing] crop {i} Swin FAISS took {t_swin - t_before_swin:.3f}s")
                 if i == 0:
                     print(f"[debug] crop {i} swin_result={swin_result}")
+
                 swin_cat = swin_result.get("predicted_category") or swin_result.get("label")
                 swin_subcat = swin_result.get("predicted_subcategory") or swin_result.get("best_subcategory")
 
-                if swin_result["confidence"] == "high":
+                if swin_cat and not _looks_like_path_label(swin_cat):
+                    final_category = swin_cat
+                elif swin_result["confidence"] == "high" and swin_cat:
                     final_category = swin_cat
                 else:
                     candidates = swin_result.get("candidate_labels", [])
@@ -168,6 +181,37 @@ def process_image(input_image, question):
         else:
             print("[warning] Swin FAISS classifier not ready; marking crop as unknown")
             final_category = "unknown"
+
+        if final_category == "unknown":
+            unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
+
+        llava_sub_result = {"answer": None}
+        subcategory_label = "unknown"
+        if final_category != "unknown":
+            # Prefer a subcategory supplied by the SWIN/FAISS neighbor metadata
+            swin_best_sub = None
+            try:
+                swin_best_sub = (swin_result or {}).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
+            except Exception:
+                swin_best_sub = None
+
+            if swin_best_sub:
+                subcategory_label = swin_best_sub
+            else:
+                try:
+                    t_before_sub = time.time()
+                    llava_sub_result = generate_llava4_answer(
+                        image=crop,
+                        broad_category=final_category,
+                        user_prompt=None,
+                    )
+                    t_sub = time.time()
+                    print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
+                    if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
+                        subcategory_label = llava_sub_result.get("answer")
+                except Exception as sub_exc:
+                    llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
+                    subcategory_label = "unknown"
 
         if final_category == "unknown":
             unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)

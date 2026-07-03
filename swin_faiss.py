@@ -24,6 +24,9 @@ def _infer_label_from_path(path: str) -> str:
     if candidate.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".npy", ".bin", ".txt")):
         candidate = os.path.splitext(candidate)[0]
     candidate = candidate.replace("_", " ").replace("-", " ").strip()
+    lowered = candidate.lower()
+    if lowered.startswith("train ") or lowered.startswith("train_") or " crop " in lowered or lowered.endswith(" crop"):
+        return "unknown"
     if candidate:
         return candidate
     return "unknown"
@@ -95,9 +98,83 @@ class SwinFaissClassifier:
             self.is_ready_flag = False
 
     def _load_paths(self):
+        def parse_csv_paths(path_to_csv):
+            rows = []
+            try:
+                import csv
+
+                with open(path_to_csv, "r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    fieldnames = [f.strip() for f in (reader.fieldnames or [])]
+                    for row in reader:
+                        if not row:
+                            continue
+                        row = {k.strip(): v for k, v in row.items() if k is not None}
+                        image_path = str(row.get("image_path", "")).strip()
+                        if not image_path:
+                            continue
+                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                        if not label:
+                            label = _infer_label_from_path(image_path)
+                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                        rows.append({"path": image_path, "label": label, "subcategory": subcategory})
+            except Exception:
+                with open(path_to_csv, "r", encoding="utf-8") as fh:
+                    lines = [line.strip() for line in fh if line.strip()]
+                    if not lines:
+                        return []
+                    headers = [h.strip() for h in lines[0].split(",")]
+                    for line in lines[1:]:
+                        values = [v.strip() for v in line.split(",")]
+                        row = dict(zip(headers, values))
+                        image_path = str(row.get("image_path", "")).strip()
+                        if not image_path:
+                            continue
+                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                        if not label:
+                            label = _infer_label_from_path(image_path)
+                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                        rows.append({"path": image_path, "label": label, "subcategory": subcategory})
+            return rows
+
+        def normalize_path(path):
+            return path.replace("\\", "/").strip()
+
+        def merge_metadata(existing_entries):
+            if not existing_entries:
+                return existing_entries
+            metadata = {}
+            try:
+                from glob import glob
+
+                for cand in glob("*.csv"):
+                    if cand in {os.path.basename(self.image_paths_path), os.path.basename(csv_path)}:
+                        continue
+                    if cand.lower().endswith(".csv"):
+                        rows = parse_csv_paths(cand)
+                        for row in rows:
+                            key = normalize_path(row["path"])
+                            metadata[key] = row
+                            metadata[os.path.basename(key)] = row
+            except Exception:
+                pass
+
+            if not metadata:
+                return existing_entries
+
+            for entry in existing_entries:
+                norm = normalize_path(entry["path"])
+                if norm in metadata:
+                    entry.update(metadata[norm])
+                else:
+                    basename = os.path.basename(norm)
+                    if basename in metadata:
+                        entry.update(metadata[basename])
+            return existing_entries
+
         if os.path.exists(self.indexed_image_paths_npy):
             data = np.load(self.indexed_image_paths_npy, allow_pickle=True)
-            return [
+            entries = [
                 {
                     "path": str(x),
                     "label": _infer_label_from_path(str(x)),
@@ -106,6 +183,8 @@ class SwinFaissClassifier:
                 for x in data.tolist()
                 if x is not None
             ]
+            return merge_metadata(entries)
+
         if os.path.exists(self.image_paths_path):
             entries = []
             with open(self.image_paths_path, "r", encoding="utf-8") as fh:
@@ -120,56 +199,14 @@ class SwinFaissClassifier:
                             "subcategory": None,
                         }
                     )
-            return entries
+            return merge_metadata(entries)
+
         csv_path = os.path.splitext(self.image_paths_path)[0] + ".csv"
         if os.path.exists(csv_path):
-            entries = []
-            try:
-                import csv
+            entries = parse_csv_paths(csv_path)
+            if entries:
+                return merge_metadata(entries)
 
-                with open(csv_path, "r", encoding="utf-8", newline="") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        if not row:
-                            continue
-                        path = str(row.get("image_path", "")).strip()
-                        if not path:
-                            continue
-                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                        if not label:
-                            label = _infer_label_from_path(path)
-                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                        entries.append(
-                            {
-                                "path": path,
-                                "label": label,
-                                "subcategory": subcategory,
-                            }
-                        )
-            except Exception:
-                with open(csv_path, "r", encoding="utf-8") as fh:
-                    lines = [line.strip() for line in fh if line.strip()]
-                    if not lines:
-                        return []
-                    headers = [h.strip() for h in lines[0].split(",")]
-                    for line in lines[1:]:
-                        values = [v.strip() for v in line.split(",")]
-                        row = dict(zip(headers, values))
-                        path = str(row.get("image_path", "")).strip()
-                        if not path:
-                            continue
-                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                        if not label:
-                            label = _infer_label_from_path(path)
-                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                        entries.append(
-                            {
-                                "path": path,
-                                "label": label,
-                                "subcategory": subcategory,
-                            }
-                        )
-            return entries
         # If no explicit indexed paths files were found, try to discover any
         # labeled CSVs in the workspace (e.g. train_product_category_58.csv)
         # that contain an `image_path` column and optional `predicted_category`
@@ -183,30 +220,11 @@ class SwinFaissClassifier:
                     # already tried this file
                     continue
                 try:
-                    with open(cand, "r", encoding="utf-8", newline="") as fh:
-                        import csv as _csv
-
-                        reader = _csv.DictReader(fh)
-                        # require an image_path column to consider this file
-                        if "image_path" not in (reader.fieldnames or []):
-                            continue
-                        entries = []
-                        for row in reader:
-                            if not row:
-                                continue
-                            path = str(row.get("image_path", "")).strip()
-                            if not path:
-                                continue
-                            label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                            if not label:
-                                label = _infer_label_from_path(path)
-                            subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                            entries.append({"path": path, "label": label, "subcategory": subcategory})
-                        if entries:
-                            print(f"[swin_faiss] discovered labeled CSV: {cand} (loaded {len(entries)} entries)")
-                            return entries
+                    rows = parse_csv_paths(cand)
+                    if rows:
+                        print(f"[swin_faiss] discovered labeled CSV: {cand} (loaded {len(rows)} entries)")
+                        return rows
                 except Exception:
-                    # ignore malformed CSVs and continue searching
                     continue
         except Exception:
             pass
