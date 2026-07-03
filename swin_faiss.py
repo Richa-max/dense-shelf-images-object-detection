@@ -32,6 +32,37 @@ def _infer_label_from_path(path: str) -> str:
     return "unknown"
 
 
+def _metadata_from_row(row: dict) -> dict:
+    metadata = {str(k).strip(): v for k, v in row.items() if k is not None}
+    image_path = str(metadata.get("image_path", "")).strip()
+    label = str(metadata.get("predicted_category") or metadata.get("category") or metadata.get("full_label") or "").strip()
+    if not label:
+        label = _infer_label_from_path(image_path)
+    subcategory = str(metadata.get("predicted_subcategory") or metadata.get("subcategory") or "").strip() or None
+    product_name = (
+        str(
+            metadata.get("product_name")
+            or metadata.get("product")
+            or metadata.get("name")
+            or metadata.get("title")
+            or metadata.get("sku_name")
+            or metadata.get("full_label_50")
+            or metadata.get("full_label")
+            or ""
+        ).strip()
+        or None
+    )
+    metadata.update(
+        {
+            "path": image_path,
+            "label": label,
+            "subcategory": subcategory,
+            "product_name": product_name,
+        }
+    )
+    return metadata
+
+
 class SwinFaissClassifier:
     def __init__(
         self,
@@ -109,15 +140,11 @@ class SwinFaissClassifier:
                     for row in reader:
                         if not row:
                             continue
-                        row = {k.strip(): v for k, v in row.items() if k is not None}
-                        image_path = str(row.get("image_path", "")).strip()
+                        row = _metadata_from_row(row)
+                        image_path = str(row.get("path", "")).strip()
                         if not image_path:
                             continue
-                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                        if not label:
-                            label = _infer_label_from_path(image_path)
-                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                        rows.append({"path": image_path, "label": label, "subcategory": subcategory})
+                        rows.append(row)
             except Exception:
                 with open(path_to_csv, "r", encoding="utf-8") as fh:
                     lines = [line.strip() for line in fh if line.strip()]
@@ -130,11 +157,7 @@ class SwinFaissClassifier:
                         image_path = str(row.get("image_path", "")).strip()
                         if not image_path:
                             continue
-                        label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                        if not label:
-                            label = _infer_label_from_path(image_path)
-                        subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                        rows.append({"path": image_path, "label": label, "subcategory": subcategory})
+                        rows.append(_metadata_from_row(row))
             return rows
 
         def normalize_path(path):
@@ -180,6 +203,7 @@ class SwinFaissClassifier:
                     "path": str(x),
                     "label": _infer_label_from_path(str(x)),
                     "subcategory": None,
+                    "product_name": None,
                 }
                 for x in data.tolist()
                 if x is not None
@@ -200,25 +224,21 @@ class SwinFaissClassifier:
                                 image_path = str(row.get("image_path", "")).strip()
                                 if not image_path:
                                     continue
-                                label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
-                                if not label:
-                                    label = _infer_label_from_path(image_path)
-                                subcategory = str(row.get("predicted_subcategory") or "").strip() or None
-                                entries.append({"path": image_path, "label": label, "subcategory": subcategory})
+                                entries.append(_metadata_from_row(row))
                         else:
                             fh.seek(0)
                             for line in fh:
                                 path = line.strip()
                                 if not path or path.lower() == "image_path":
                                     continue
-                                entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None})
+                                entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None, "product_name": None})
                 except Exception:
                     with open(self.image_paths_path, "r", encoding="utf-8") as fh:
                         for line in fh:
                             path = line.strip()
                             if not path or path.lower() == "image_path":
                                 continue
-                            entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None})
+                            entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None, "product_name": None})
             else:
                 with open(self.image_paths_path, "r", encoding="utf-8") as fh:
                     for line in fh:
@@ -290,14 +310,19 @@ class SwinFaissClassifier:
             path = data.get("path") if isinstance(data, dict) else str(data)
             label = data.get("label") if isinstance(data, dict) else _infer_label_from_path(path)
             subcategory = data.get("subcategory") if isinstance(data, dict) else None
-            neighbors.append(
-                {
-                    "path": path,
-                    "label": label,
-                    "subcategory": subcategory,
-                    "score": float(score),
-                }
-            )
+            product_name = data.get("product_name") if isinstance(data, dict) else None
+            neighbor = {
+                "path": path,
+                "label": label,
+                "subcategory": subcategory,
+                "product_name": product_name,
+                "score": float(score),
+            }
+            if isinstance(data, dict):
+                for key in ["brand", "barcode", "sku", "full_label", "full_label_50"]:
+                    if key in data:
+                        neighbor[key] = data.get(key)
+            neighbors.append(neighbor)
 
         return neighbors
 

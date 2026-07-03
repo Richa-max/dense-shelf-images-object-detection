@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 
 import gradio as gr
 from PIL import Image, ImageDraw
@@ -23,10 +25,22 @@ if os.path.exists(_SC_PATH):
     except Exception:
         _SUBCATS = {}
 from llava4_model import generate_llava4_answer
+from retail_product_resolver import resolve_retail_product, summarize_retail_decisions
 
 
 yolo_model = YOLO("models/yolo/best.pt")
 swin_classifier = load_swin_faiss_classifier()
+
+
+def _clean_label(value):
+    return str(value or "").strip()
+
+
+def _is_distinct_product_name(product, category, subcategory):
+    product = _clean_label(product)
+    if not product or product.lower() in {"unknown", "none", "n/a", "na"}:
+        return False
+    return product.lower() not in {_clean_label(category).lower(), _clean_label(subcategory).lower()}
 
 def pad_box(x1, y1, x2, y2, img_w, img_h, pad=10):
     x1 = max(0, int(x1 - pad))
@@ -190,9 +204,6 @@ def process_image(input_image, question):
             print("[warning] Swin FAISS classifier not ready; marking crop as unknown")
             final_category = "unknown"
 
-        if final_category == "unknown":
-            unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
-
         llava_sub_result = {"answer": None}
         subcategory_label = "unknown"
         if final_category != "unknown":
@@ -222,6 +233,33 @@ def process_image(input_image, question):
                     llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
                     subcategory_label = "unknown"
 
+        t_before_retail = time.time()
+        retail_product = resolve_retail_product(
+            image=crop,
+            swin_result=swin_result,
+            category_hint=final_category,
+            subcategory_hint=subcategory_label,
+            disable_slm=os.getenv("DISABLE_RETAIL_SLM", "0").strip().lower() in {"1", "true", "yes"},
+        )
+        t_retail = time.time()
+        print(f"[timing] crop {i} retail OCR/SLM resolver took {t_retail - t_before_retail:.3f}s")
+
+        retail_decision = retail_product.get("decision") or {}
+        ocr_info = retail_product.get("ocr") or {}
+        slm_info = retail_product.get("slm") or {}
+        print(
+            "[debug] crop "
+            f"{i} OCR backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
+            f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
+        )
+        if retail_decision.get("category") and retail_decision.get("category") != "unknown":
+            final_category = retail_decision["category"]
+        if retail_decision.get("subcategory") and retail_decision.get("subcategory") != "unknown":
+            subcategory_label = retail_decision["subcategory"]
+
+        if final_category == "unknown":
+            unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
+
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
 
@@ -234,6 +272,7 @@ def process_image(input_image, question):
                 "swin": swin_result,
                 "clip": clip_result,
                 "llava_subcategory": llava_sub_result,
+                "retail_product": retail_product,
             }
         )
 
@@ -272,6 +311,27 @@ def process_image(input_image, question):
     else:
         summary_lines.append("<p><strong>Top categories:</strong> none detected yet.</p>")
 
+    retail_summary = summarize_retail_decisions(rows)
+    top_products = retail_summary.get("top_products") or []
+    if top_products:
+        product_lines = [f"{cnt} x {name}" for name, cnt in top_products[:5]]
+        summary_lines.append(
+            f"<p><strong>Likely products:</strong> {', '.join(product_lines)}</p>"
+        )
+
+    ocr_attempted = sum(1 for r in rows if (r.get("retail_product") or {}).get("ocr"))
+    ocr_available = sum(1 for r in rows if ((r.get("retail_product") or {}).get("ocr") or {}).get("available"))
+    slm_used = sum(
+        1
+        for r in rows
+        if (((r.get("retail_product") or {}).get("slm") or {}).get("source") not in {None, "", "heuristic"})
+    )
+    if rows:
+        summary_lines.append(
+            f"<p><strong>OCR/SLM status:</strong> OCR available for {ocr_available}/{ocr_attempted} crop"
+            f"{'s' if ocr_attempted != 1 else ''}; retail SLM used for {slm_used}/{len(rows)}.</p>"
+        )
+
     if unknown_items:
         summary_lines.append(
             f"<p><strong>Manual review needed:</strong> {len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may be unclear and should be checked manually.</p>"
@@ -295,8 +355,17 @@ def process_image(input_image, question):
                     f"<li>Item {cid} could not be confidently identified and should be reviewed.</li>"
                 )
             else:
+                retail_decision = (r.get("retail_product") or {}).get("decision") or {}
+                product = retail_decision.get("predicted_product")
+                confidence = retail_decision.get("confidence")
+                product_prefix = ""
+                if _is_distinct_product_name(product, cat, sub):
+                    product_prefix = f"<strong>{product}</strong>, "
+                confidence_suffix = ""
+                if isinstance(confidence, (int, float)):
+                    confidence_suffix = f" ({confidence*100:.0f}% confidence)"
                 summary_lines.append(
-                    f"<li>Item {cid} is likely <strong>{cat}</strong> with subcategory <strong>{sub}</strong>.</li>"
+                    f"<li>Item {cid} is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.</li>"
                 )
         summary_lines.append("</ol>")
     else:
@@ -355,4 +424,9 @@ demo = gr.Interface(
 )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
+    demo.launch(
+        server_name=os.getenv("GRADIO_SERVER_NAME", "127.0.0.1"),
+        server_port=int(os.getenv("PORT", "7860")),
+        show_error=True,
+        inbrowser=False,
+    )

@@ -9,6 +9,7 @@ import time
 from llava4_model import generate_llava4_answer
 import json
 import os
+from retail_product_resolver import resolve_retail_product
 
 # load default subcategories mapping if present
 _SUBCATS = {}
@@ -48,7 +49,12 @@ def pad_box(x1, y1, x2, y2, img_w, img_h, pad=12):
     return x1, y1, x2, y2
 
 
-def _classify_crop_image(img: Image.Image, disable_llava: bool = False, llava_prompt: str = None) -> dict:
+def _classify_crop_image(
+    img: Image.Image,
+    disable_llava: bool = False,
+    llava_prompt: str = None,
+    disable_retail_slm: bool = False,
+) -> dict:
     if not swin_classifier.is_ready():
         raise RuntimeError("Swin FAISS classifier is not ready")
 
@@ -72,6 +78,7 @@ def _classify_crop_image(img: Image.Image, disable_llava: bool = False, llava_pr
             clip_result = {"label": "unknown", "score": 0.0, "all": {}}
 
     llava4_result = None
+    subcategory_label = None
     if not disable_llava and result_label != "unknown":
         try:
             llava4_result = generate_llava4_answer(
@@ -79,6 +86,8 @@ def _classify_crop_image(img: Image.Image, disable_llava: bool = False, llava_pr
                 broad_category=result_label,
                 user_prompt=llava_prompt,
             )
+            if isinstance(llava4_result, dict):
+                subcategory_label = llava4_result.get("answer")
         except Exception as llava_exc:
             llava4_result = {
                 "error": "llava4_failed",
@@ -87,11 +96,31 @@ def _classify_crop_image(img: Image.Image, disable_llava: bool = False, llava_pr
     elif disable_llava:
         llava4_result = {"status": "skipped", "reason": "disable_llava=true"}
 
+    retail_product = resolve_retail_product(
+        image=img,
+        swin_result=swin_result,
+        category_hint=result_label,
+        subcategory_hint=subcategory_label,
+        disable_slm=disable_retail_slm,
+    )
+    ocr_info = retail_product.get("ocr") or {}
+    slm_info = retail_product.get("slm") or {}
+    print(
+        "[debug] classify crop OCR "
+        f"backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
+        f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
+    )
+
+    decision = retail_product.get("decision") or {}
+    if decision.get("category") and decision.get("category") != "unknown":
+        result_label = decision["category"]
+
     return {
         "category": result_label,
         "swin": swin_result,
         "clip": clip_result,
         "llava4": llava4_result,
+        "retail_product": retail_product,
     }
 
 
@@ -115,6 +144,7 @@ def classify_crop():
     user_requested_llava = _to_bool(request.form.get("user_requested_llava"))
     fine_grained = _to_bool(request.form.get("fine_grained"))
     disable_llava = _to_bool(request.form.get("disable_llava"))
+    disable_retail_slm = _to_bool(request.form.get("disable_retail_slm"))
     llava_prompt = request.form.get("llava_prompt")
     # CLIP subcategory options: either provide a JSON list in 'subcategories'
     # or send newline-separated values. Also accepts boolean 'use_clip'.
@@ -170,6 +200,7 @@ def classify_crop():
                 clip_result = {"label": "unknown", "score": 0.0, "all": {}}
 
         llava4_result = None
+        subcategory_label = None
         if not disable_llava and result_label != "unknown":
             try:
                 t_before_llava = time.time()
@@ -180,6 +211,8 @@ def classify_crop():
                 )
                 t_llava = time.time()
                 print(f"[timing] LLaVA4 inference took {t_llava - t_before_llava:.3f}s")
+                if isinstance(llava4_result, dict):
+                    subcategory_label = llava4_result.get("answer")
             except Exception as llava_exc:
                 llava4_result = {
                     "error": "llava4_failed",
@@ -187,6 +220,28 @@ def classify_crop():
                 }
         elif disable_llava:
             llava4_result = {"status": "skipped", "reason": "disable_llava=true"}
+
+        t_before_retail = time.time()
+        retail_product = resolve_retail_product(
+            image=img,
+            swin_result=swin_result,
+            category_hint=result_label,
+            subcategory_hint=subcategory_label,
+            disable_slm=disable_retail_slm,
+        )
+        t_retail = time.time()
+        print(f"[timing] retail OCR/SLM resolver took {t_retail - t_before_retail:.3f}s")
+        ocr_info = retail_product.get("ocr") or {}
+        slm_info = retail_product.get("slm") or {}
+        print(
+            "[debug] classify_crop OCR "
+            f"backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
+            f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
+        )
+
+        decision = retail_product.get("decision") or {}
+        if decision.get("category") and decision.get("category") != "unknown":
+            result_label = decision["category"]
     except Exception as e:
         return jsonify({"error": "inference failed", "details": str(e)}), 500
 
@@ -196,6 +251,7 @@ def classify_crop():
             "swin": swin_result,
             "clip": clip_result,
             "llava4": llava4_result,
+            "retail_product": retail_product,
         }
     )
 
@@ -212,6 +268,7 @@ def classify_shelf():
         return jsonify({"error": "cannot open image", "details": str(e)}), 400
 
     disable_llava = _to_bool(request.form.get("disable_llava"))
+    disable_retail_slm = _to_bool(request.form.get("disable_retail_slm"))
     llava_prompt = request.form.get("llava_prompt")
 
     if not swin_classifier.is_ready():
@@ -225,7 +282,12 @@ def classify_shelf():
             x1, y1, x2, y2 = [int(v) for v in box[:4]]
             px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img.width, img.height)
             crop = img.crop((px1, py1, px2, py2))
-            classification = _classify_crop_image(crop, disable_llava=disable_llava, llava_prompt=llava_prompt)
+            classification = _classify_crop_image(
+                crop,
+                disable_llava=disable_llava,
+                llava_prompt=llava_prompt,
+                disable_retail_slm=disable_retail_slm,
+            )
             items.append(
                 {
                     "crop_id": idx,
@@ -234,6 +296,7 @@ def classify_shelf():
                     "swin": classification["swin"],
                     "clip": classification["clip"],
                     "llava4": classification["llava4"],
+                    "retail_product": classification["retail_product"],
                 }
             )
     except Exception as e:
