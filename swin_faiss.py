@@ -283,32 +283,24 @@ class SwinFaissClassifier:
                 "confidence": "low",
             }
 
-        label_counts = Counter([n["label"] for n in neighbors if n["label"] != "unknown"])
-        if not label_counts:
-            candidate_labels = []
-            best_label = "unknown"
-        else:
-            candidate_labels = [label for label, _ in label_counts.most_common(top_labels)]
-            best_label = candidate_labels[0]
-
-        best_score = float(max((n["score"] for n in neighbors), default=0.0))
-        confidence = "low"
-        if best_score >= 0.75:
-            confidence = "high"
-        elif best_score >= 0.45:
-            confidence = "medium"
-
-        best_neighbor = next((n for n in neighbors if n.get("label") == best_label and n.get("subcategory")), None)
-        if best_neighbor is None:
-            best_neighbor = next((n for n in neighbors if n.get("label") == best_label), None)
-
+        candidate_labels = [n["label"] for n in neighbors if n["label"] != "unknown"]
+        # Preserve the top neighbor as the direct match from FAISS.
+        best_neighbor = neighbors[0] if neighbors else None
+        best_label = best_neighbor["label"] if best_neighbor else "unknown"
         best_subcategory = best_neighbor.get("subcategory") if best_neighbor else None
+
+        best_score = float(best_neighbor["score"] if best_neighbor is not None else 0.0)
+        confidence = "low"
+        if best_score <= 0.35:
+            confidence = "high"
+        elif best_score <= 0.75:
+            confidence = "medium"
 
         return {
             "label": best_label,
             "predicted_category": best_label,
             "score": best_score,
-            "candidate_labels": candidate_labels,
+            "candidate_labels": candidate_labels[:top_labels],
             "neighbors": neighbors,
             "confidence": confidence,
             "best_subcategory": best_subcategory,

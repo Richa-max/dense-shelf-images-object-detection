@@ -130,6 +130,16 @@ def process_image(input_image, question):
             return True
         return False
 
+    def _is_valid_label(label: str) -> bool:
+        if not label:
+            return False
+        cleaned = label.strip()
+        if cleaned.lower() in {"unknown", "n/a", "na", "none"}:
+            return False
+        if _looks_like_path_label(cleaned):
+            return False
+        return True
+
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box[:4]
         px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w, img_h, pad=12)
@@ -152,9 +162,7 @@ def process_image(input_image, question):
                 swin_cat = swin_result.get("predicted_category") or swin_result.get("label")
                 swin_subcat = swin_result.get("predicted_subcategory") or swin_result.get("best_subcategory")
 
-                if swin_cat and not _looks_like_path_label(swin_cat):
-                    final_category = swin_cat
-                elif swin_result["confidence"] == "high" and swin_cat:
+                if _is_valid_label(swin_cat):
                     final_category = swin_cat
                 else:
                     candidates = swin_result.get("candidate_labels", [])
@@ -196,7 +204,7 @@ def process_image(input_image, question):
             except Exception:
                 swin_best_sub = None
 
-            if swin_best_sub and not _looks_like_path_label(swin_best_sub):
+            if swin_best_sub and _is_valid_label(swin_best_sub):
                 subcategory_label = swin_best_sub
             else:
                 try:
