@@ -170,6 +170,47 @@ class SwinFaissClassifier:
                             }
                         )
             return entries
+        # If no explicit indexed paths files were found, try to discover any
+        # labeled CSVs in the workspace (e.g. train_product_category_58.csv)
+        # that contain an `image_path` column and optional `predicted_category`
+        # and `predicted_subcategory` columns.
+        try:
+            from glob import glob
+
+            candidates = glob("*.csv")
+            for cand in candidates:
+                if cand == os.path.basename(csv_path):
+                    # already tried this file
+                    continue
+                try:
+                    with open(cand, "r", encoding="utf-8", newline="") as fh:
+                        import csv as _csv
+
+                        reader = _csv.DictReader(fh)
+                        # require an image_path column to consider this file
+                        if "image_path" not in (reader.fieldnames or []):
+                            continue
+                        entries = []
+                        for row in reader:
+                            if not row:
+                                continue
+                            path = str(row.get("image_path", "")).strip()
+                            if not path:
+                                continue
+                            label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                            if not label:
+                                label = _infer_label_from_path(path)
+                            subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                            entries.append({"path": path, "label": label, "subcategory": subcategory})
+                        if entries:
+                            print(f"[swin_faiss] discovered labeled CSV: {cand} (loaded {len(entries)} entries)")
+                            return entries
+                except Exception:
+                    # ignore malformed CSVs and continue searching
+                    continue
+        except Exception:
+            pass
+
         return []
 
     def _embed_image(self, image: Image.Image) -> np.ndarray:
@@ -239,12 +280,24 @@ class SwinFaissClassifier:
         elif best_score >= 0.45:
             confidence = "medium"
 
+        # Derive the most common subcategory among neighbors that match the
+        # chosen best_label (if any subcategory metadata is present).
+        best_subcategory = None
+        subcats = [n.get("subcategory") for n in neighbors if n.get("label") == best_label and n.get("subcategory")]
+        if subcats:
+            from collections import Counter as _Counter
+
+            best_subcategory = _Counter(subcats).most_common(1)[0][0]
+
         return {
             "label": best_label,
+            "predicted_category": best_label,
             "score": best_score,
             "candidate_labels": candidate_labels,
             "neighbors": neighbors,
             "confidence": confidence,
+            "best_subcategory": best_subcategory,
+            "predicted_subcategory": best_subcategory,
         }
 
     def save_unknown_crop(self, crop: Image.Image, crop_id: int, output_dir: str = "unknown_crops") -> str:

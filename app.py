@@ -138,8 +138,11 @@ def process_image(input_image, question):
                 print(f"[timing] crop {i} Swin FAISS took {t_swin - t_before_swin:.3f}s")
                 if i == 0:
                     print(f"[debug] crop {i} swin_result={swin_result}")
+                swin_cat = swin_result.get("predicted_category") or swin_result.get("label")
+                swin_subcat = swin_result.get("predicted_subcategory") or swin_result.get("best_subcategory")
+
                 if swin_result["confidence"] == "high":
-                    final_category = swin_result["label"]
+                    final_category = swin_cat
                 else:
                     candidates = swin_result.get("candidate_labels", [])
                     if candidates:
@@ -172,20 +175,30 @@ def process_image(input_image, question):
         llava_sub_result = {"answer": None}
         subcategory_label = "unknown"
         if final_category != "unknown":
+            # Prefer a subcategory supplied by the SWIN/FAISS neighbor metadata
+            swin_best_sub = None
             try:
-                t_before_sub = time.time()
-                llava_sub_result = generate_llava4_answer(
-                    image=crop,
-                    broad_category=final_category,
-                    user_prompt=None,
-                )
-                t_sub = time.time()
-                print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
-                if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
-                    subcategory_label = llava_sub_result.get("answer")
-            except Exception as sub_exc:
-                llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
-                subcategory_label = "unknown"
+                swin_best_sub = (swin_result or {}).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
+            except Exception:
+                swin_best_sub = None
+
+            if swin_best_sub:
+                subcategory_label = swin_best_sub
+            else:
+                try:
+                    t_before_sub = time.time()
+                    llava_sub_result = generate_llava4_answer(
+                        image=crop,
+                        broad_category=final_category,
+                        user_prompt=None,
+                    )
+                    t_sub = time.time()
+                    print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
+                    if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
+                        subcategory_label = llava_sub_result.get("answer")
+                except Exception as sub_exc:
+                    llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
+                    subcategory_label = "unknown"
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
