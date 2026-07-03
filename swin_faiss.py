@@ -38,7 +38,7 @@ class SwinFaissClassifier:
         model_dir: str = "swin_model_assets",
         processor_dir: str = "swin_processor_assets",
         index_path: str = "swin_faiss_index.bin",
-        image_paths_path: str = "swin_faiss_indexed_image_paths.txt",
+        image_paths_path: str = "swin_faiss_indexed_image_paths.csv",
         indexed_image_paths_npy: str = "swin_faiss_indexed_image_paths.npy",
     ):
         self.model_dir = model_dir
@@ -144,11 +144,12 @@ class SwinFaissClassifier:
             if not existing_entries:
                 return existing_entries
             metadata = {}
+            excluded_filenames = {os.path.basename(self.image_paths_path)}
             try:
                 from glob import glob
 
                 for cand in glob("*.csv"):
-                    if cand in {os.path.basename(self.image_paths_path), os.path.basename(csv_path)}:
+                    if cand in excluded_filenames:
                         continue
                     if cand.lower().endswith(".csv"):
                         rows = parse_csv_paths(cand)
@@ -187,19 +188,46 @@ class SwinFaissClassifier:
 
         if os.path.exists(self.image_paths_path):
             entries = []
-            with open(self.image_paths_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    path = line.strip()
-                    if not path:
-                        continue
-                    entries.append(
-                        {
-                            "path": path,
-                            "label": _infer_label_from_path(path),
-                            "subcategory": None,
-                        }
-                    )
-            return merge_metadata(entries)
+            if self.image_paths_path.lower().endswith(".csv"):
+                try:
+                    import csv
+                    with open(self.image_paths_path, "r", encoding="utf-8", newline="") as fh:
+                        reader = csv.DictReader(fh)
+                        if reader.fieldnames and "image_path" in [f.strip() for f in reader.fieldnames]:
+                            for row in reader:
+                                if not row:
+                                    continue
+                                image_path = str(row.get("image_path", "")).strip()
+                                if not image_path:
+                                    continue
+                                label = str(row.get("predicted_category") or row.get("full_label") or "").strip()
+                                if not label:
+                                    label = _infer_label_from_path(image_path)
+                                subcategory = str(row.get("predicted_subcategory") or "").strip() or None
+                                entries.append({"path": image_path, "label": label, "subcategory": subcategory})
+                        else:
+                            fh.seek(0)
+                            for line in fh:
+                                path = line.strip()
+                                if not path or path.lower() == "image_path":
+                                    continue
+                                entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None})
+                except Exception:
+                    with open(self.image_paths_path, "r", encoding="utf-8") as fh:
+                        for line in fh:
+                            path = line.strip()
+                            if not path or path.lower() == "image_path":
+                                continue
+                            entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None})
+            else:
+                with open(self.image_paths_path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        path = line.strip()
+                        if not path:
+                            continue
+                        entries.append({"path": path, "label": _infer_label_from_path(path), "subcategory": None})
+            if entries:
+                return merge_metadata(entries)
 
         csv_path = os.path.splitext(self.image_paths_path)[0] + ".csv"
         if os.path.exists(csv_path):
@@ -232,16 +260,17 @@ class SwinFaissClassifier:
         return []
 
     def _embed_image(self, image: Image.Image) -> np.ndarray:
-        inputs = self.processor(images=image, return_tensors="pt")
-        pixel_values = inputs.pixel_values.to(self.device)
+        # Notebook-aligned Swin embedding extraction:
+        # - using PIL image input
+        # - using AutoImageProcessor and AutoModel from transformers
+        # - calling model.eval() and torch.no_grad()
+        # - using mean pooling over last_hidden_state, not class logits
+        # - keeping embeddings raw, matching FAISS index built from non-normalized vectors
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            outputs = self.model(pixel_values=pixel_values)
-            hidden = getattr(outputs, "pooler_output", None)
-            if hidden is None:
-                hidden = outputs.last_hidden_state.mean(dim=1)
-        emb = hidden.detach().cpu().numpy()
-        norm = np.linalg.norm(emb, axis=-1, keepdims=True)
-        emb = emb / np.clip(norm, a_min=1e-9, a_max=None)
+            outputs = self.model(**inputs)
+            hidden = outputs.last_hidden_state.mean(dim=1)
+        emb = hidden.cpu().numpy()
         return emb.astype("float32")
 
     def query(self, image: Image.Image, top_k: int = 10):
@@ -293,21 +322,8 @@ class SwinFaissClassifier:
                 "confidence": "low",
             }
 
-        # Score category and subcategory labels from the top neighbors.
-        cat_scores = {}
-        subcat_scores = {}
-        for neighbor in neighbors:
-            label = neighbor.get("label")
-            subcat = neighbor.get("subcategory")
-            sim = self._distance_to_similarity(neighbor.get("score", 0.0))
-            if not label or label == "unknown":
-                continue
-            cat_scores[label] = cat_scores.get(label, 0.0) + sim
-            if subcat and subcat != "unknown":
-                key = (label, subcat)
-                subcat_scores[key] = subcat_scores.get(key, 0.0) + sim
-
-        if not cat_scores:
+        valid_neighbors = [n for n in neighbors if n.get("label") and n.get("label") != "unknown"]
+        if not valid_neighbors:
             return {
                 "label": "unknown",
                 "score": 0.0,
@@ -316,34 +332,19 @@ class SwinFaissClassifier:
                 "confidence": "low",
             }
 
-        sorted_categories = sorted(cat_scores.items(), key=lambda item: item[1], reverse=True)
-        best_label = sorted_categories[0][0]
-        candidate_labels = [label for label, _ in sorted_categories[:top_labels]]
+        best_neighbor = valid_neighbors[0]
+        best_label = best_neighbor["label"]
+        best_subcategory = best_neighbor.get("subcategory")
+        candidate_labels = [n["label"] for n in valid_neighbors[:top_labels]]
 
-        best_subcategory = None
-        best_subcat_score = 0.0
-        for (label, subcat), score in subcat_scores.items():
-            if label != best_label:
-                continue
-            if score > best_subcat_score:
-                best_subcategory = subcat
-                best_subcat_score = score
-
-        best_neighbor = next((n for n in neighbors if n.get("label") == best_label), neighbors[0])
         best_score = float(best_neighbor.get("score", 0.0))
-        confidence = "low"
-        if best_score <= 0.35:
-            confidence = "high"
-        elif best_score <= 0.75:
-            confidence = "medium"
-
         return {
             "label": best_label,
             "predicted_category": best_label,
             "score": best_score,
             "candidate_labels": candidate_labels,
             "neighbors": neighbors,
-            "confidence": confidence,
+            "confidence": "high" if best_label != "unknown" else "low",
             "best_subcategory": best_subcategory,
             "predicted_subcategory": best_subcategory,
         }
