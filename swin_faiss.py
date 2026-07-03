@@ -272,6 +272,16 @@ class SwinFaissClassifier:
 
         return neighbors
 
+    def _distance_to_similarity(self, distance: float) -> float:
+        # Convert FAISS distance output to a similarity score in [0, 1].
+        # For normalized embeddings, L2 distance range is [0, 2], and inner-product
+        # similarity is in [-1, 1]. We normalize both into a positive score range.
+        if distance is None:
+            return 0.0
+        if distance <= 1.0:
+            return max(0.0, 1.0 - distance / 2.0)
+        return max(0.0, 1.0 / (1.0 + distance))
+
     def classify(self, image: Image.Image, top_k: int = 10, top_labels: int = 5) -> dict:
         neighbors = self.query(image, top_k=top_k)
         if not neighbors:
@@ -283,13 +293,44 @@ class SwinFaissClassifier:
                 "confidence": "low",
             }
 
-        candidate_labels = [n["label"] for n in neighbors if n["label"] != "unknown"]
-        # Preserve the top neighbor as the direct match from FAISS.
-        best_neighbor = neighbors[0] if neighbors else None
-        best_label = best_neighbor["label"] if best_neighbor else "unknown"
-        best_subcategory = best_neighbor.get("subcategory") if best_neighbor else None
+        # Score category and subcategory labels from the top neighbors.
+        cat_scores = {}
+        subcat_scores = {}
+        for neighbor in neighbors:
+            label = neighbor.get("label")
+            subcat = neighbor.get("subcategory")
+            sim = self._distance_to_similarity(neighbor.get("score", 0.0))
+            if not label or label == "unknown":
+                continue
+            cat_scores[label] = cat_scores.get(label, 0.0) + sim
+            if subcat and subcat != "unknown":
+                key = (label, subcat)
+                subcat_scores[key] = subcat_scores.get(key, 0.0) + sim
 
-        best_score = float(best_neighbor["score"] if best_neighbor is not None else 0.0)
+        if not cat_scores:
+            return {
+                "label": "unknown",
+                "score": 0.0,
+                "candidate_labels": [],
+                "neighbors": neighbors,
+                "confidence": "low",
+            }
+
+        sorted_categories = sorted(cat_scores.items(), key=lambda item: item[1], reverse=True)
+        best_label = sorted_categories[0][0]
+        candidate_labels = [label for label, _ in sorted_categories[:top_labels]]
+
+        best_subcategory = None
+        best_subcat_score = 0.0
+        for (label, subcat), score in subcat_scores.items():
+            if label != best_label:
+                continue
+            if score > best_subcat_score:
+                best_subcategory = subcat
+                best_subcat_score = score
+
+        best_neighbor = next((n for n in neighbors if n.get("label") == best_label), neighbors[0])
+        best_score = float(best_neighbor.get("score", 0.0))
         confidence = "low"
         if best_score <= 0.35:
             confidence = "high"
@@ -300,7 +341,7 @@ class SwinFaissClassifier:
             "label": best_label,
             "predicted_category": best_label,
             "score": best_score,
-            "candidate_labels": candidate_labels[:top_labels],
+            "candidate_labels": candidate_labels,
             "neighbors": neighbors,
             "confidence": confidence,
             "best_subcategory": best_subcategory,
