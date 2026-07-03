@@ -298,14 +298,11 @@ class SwinFaissClassifier:
         elif best_score >= 0.45:
             confidence = "medium"
 
-        # Derive the most common subcategory among neighbors that match the
-        # chosen best_label (if any subcategory metadata is present).
-        best_subcategory = None
-        subcats = [n.get("subcategory") for n in neighbors if n.get("label") == best_label and n.get("subcategory")]
-        if subcats:
-            from collections import Counter as _Counter
+        best_neighbor = next((n for n in neighbors if n.get("label") == best_label and n.get("subcategory")), None)
+        if best_neighbor is None:
+            best_neighbor = next((n for n in neighbors if n.get("label") == best_label), None)
 
-            best_subcategory = _Counter(subcats).most_common(1)[0][0]
+        best_subcategory = best_neighbor.get("subcategory") if best_neighbor else None
 
         return {
             "label": best_label,

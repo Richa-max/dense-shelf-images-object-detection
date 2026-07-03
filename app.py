@@ -188,45 +188,15 @@ def process_image(input_image, question):
         llava_sub_result = {"answer": None}
         subcategory_label = "unknown"
         if final_category != "unknown":
-            # Prefer a subcategory supplied by the SWIN/FAISS neighbor metadata
             swin_best_sub = None
             try:
-                swin_best_sub = (swin_result or {}).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
+                swin_best_sub = (
+                    swin_result or {}
+                ).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
             except Exception:
                 swin_best_sub = None
 
-            if swin_best_sub:
-                subcategory_label = swin_best_sub
-            else:
-                try:
-                    t_before_sub = time.time()
-                    llava_sub_result = generate_llava4_answer(
-                        image=crop,
-                        broad_category=final_category,
-                        user_prompt=None,
-                    )
-                    t_sub = time.time()
-                    print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
-                    if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
-                        subcategory_label = llava_sub_result.get("answer")
-                except Exception as sub_exc:
-                    llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
-                    subcategory_label = "unknown"
-
-        if final_category == "unknown":
-            unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
-
-        llava_sub_result = {"answer": None}
-        subcategory_label = "unknown"
-        if final_category != "unknown":
-            # Prefer a subcategory supplied by the SWIN/FAISS neighbor metadata
-            swin_best_sub = None
-            try:
-                swin_best_sub = (swin_result or {}).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
-            except Exception:
-                swin_best_sub = None
-
-            if swin_best_sub:
+            if swin_best_sub and not _looks_like_path_label(swin_best_sub):
                 subcategory_label = swin_best_sub
             else:
                 try:
