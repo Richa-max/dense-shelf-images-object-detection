@@ -19,6 +19,5 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # Replace the URL below with your actual Hugging Face Space Git URL
-                  run: |
+          # Replace the URL below with your actual Hugging Face Space Git URL             
           git push --force https://x-access-token:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/richasaxenalal/dense-shelf-object-detection main
