@@ -1,3 +1,15 @@
+---
+title: Dense Shelf Object Detection
+emoji: 🛒
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+sdk_version: 5.0.0
+app_file: app.py
+pinned: false
+license: mit
+---
+
 # Shelf Object Detection
 
 This project provides a Gradio UI for shelf image upload, YOLO-based crop detection, and LLaVA-based product category prediction.
