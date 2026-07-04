@@ -23,6 +23,7 @@ if os.path.exists(_SC_PATH):
             _SUBCATS = json.load(fh)
     except Exception:
         _SUBCATS = {}
+from llava4_model import generate_llava4_answer
 from retail_product_resolver import resolve_retail_product, summarize_retail_decisions
 
 
@@ -195,6 +196,7 @@ def process_image(input_image, question):
                 "clip": None,
                 "llava_subcategory": {"answer": None, "status": "disabled"},
                 "retail_product": retail_product,
+                "crop_image": crop,
             }
         )
 
@@ -309,14 +311,47 @@ def process_image(input_image, question):
 
     selected_answer = question_answers.get(question, "Please upload an image and select a question.")
     answer_html = f"<p><b>{question}</b><br>{selected_answer}</p>"
-    return annotated, summary_html, answer_html
+    box_choices = [str(r["crop_id"]) for r in rows]
+    initial_choice = box_choices[0] if box_choices else None
+    return annotated, summary_html, answer_html, gr.update(choices=box_choices, value=initial_choice), rows
 
 
-demo = gr.Interface(
-    fn=process_image,
-    inputs=[
-        gr.Image(type="pil", label="Upload shelf image"),
-        gr.Dropdown(
+def inspect_selected_crop(selected_crop_id, rows_state):
+    if not rows_state:
+        return "<p>No detected boxes are available yet.</p>"
+    try:
+        crop_id = int(selected_crop_id)
+    except (TypeError, ValueError):
+        return "<p>Please select a detected box first.</p>"
+
+    for row in rows_state:
+        if int(row.get("crop_id", -1)) != crop_id:
+            continue
+        crop_image = row.get("crop_image")
+        if crop_image is None:
+            return f"<p>Crop {crop_id} was detected but no image crop is available.</p>"
+        prompt = (
+            "Identify the exact SKU, product name, or brand visible in this crop. "
+            "Return a short answer only."
+        )
+        result = generate_llava4_answer(
+            image=crop_image,
+            broad_category=row.get("product_category") or "unknown",
+            user_prompt=prompt,
+        )
+        answer = (result.get("answer") or "").strip()
+        if not answer:
+            answer = result.get("error") or "No SKU was detected."
+        return f"<p><b>Selected box {crop_id}</b><br>{answer}</p>"
+
+    return f"<p>No detected box with id {crop_id} was found.</p>"
+
+
+with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
+    gr.Markdown("Upload a shelf image to detect product categories and inspect a specific boxed item with LLaVA.")
+    with gr.Row():
+        image_input = gr.Image(type="pil", label="Upload shelf image")
+        question_input = gr.Dropdown(
             choices=[
                 "How many products were detected on this shelf?",
                 "Which are the top detected categories by count?",
@@ -326,16 +361,28 @@ demo = gr.Interface(
             ],
             value="How many products were detected on this shelf?",
             label="Select a Store Management question",
-        ),
-    ],
-    outputs=[
-        gr.Image(type="pil", label="Annotated image"),
-        gr.HTML(label="Summary"),
-        gr.HTML(label="Selected question answer"),
-    ],
-    title="Smart Shelf Management Dashboard",
-    description="Upload a shelf image to detect product categories and subcategories and answer key store management questions.",
-)
+        )
+    analyze_button = gr.Button("Analyze shelf")
+    with gr.Row():
+        output_image = gr.Image(type="pil", label="Annotated image")
+        output_summary = gr.HTML(label="Summary")
+        output_answer = gr.HTML(label="Selected question answer")
+    with gr.Row():
+        crop_selector = gr.Dropdown(choices=[], label="Select a detected box to inspect")
+        inspect_button = gr.Button("Inspect selected box with LLaVA")
+    output_sku = gr.HTML(label="SKU / product detail")
+    rows_state = gr.State(value=[])
+
+    analyze_button.click(
+        process_image,
+        inputs=[image_input, question_input],
+        outputs=[output_image, output_summary, output_answer, crop_selector, rows_state],
+    )
+    inspect_button.click(
+        inspect_selected_crop,
+        inputs=[crop_selector, rows_state],
+        outputs=[output_sku],
+    )
 
 if __name__ == "__main__":
     demo.launch(

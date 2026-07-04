@@ -18,16 +18,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LLAMA_MODEL_ID=meta-llama/Meta-Llama-3.1-8B-Instruct \
     LLAMA_DEVICE_MAP=auto \
     LLAMA_LOAD_IN_4BIT=1 \
+    OLLAMA_AUTOSTART=1 \
+    OLLAMA_MODELS=/workspace/.ollama/models \
+    LLAVA_PROVIDER=ollama \
+    OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+    OLLAMA_MODEL=llava:13b \
     PORT=7860
 
 WORKDIR /workspace/app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     git \
     libgl1 \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://ollama.com/install.sh | sh
 
 COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
