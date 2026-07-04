@@ -9,7 +9,6 @@ import base64
 import numpy as np
 from ultralytics import YOLO
 
-from clip_model import classify_with_clip_pil
 from swin_faiss import load_swin_faiss_classifier
 import json
 import time
@@ -24,7 +23,6 @@ if os.path.exists(_SC_PATH):
             _SUBCATS = json.load(fh)
     except Exception:
         _SUBCATS = {}
-from llava4_model import generate_llava4_answer
 from retail_product_resolver import resolve_retail_product, summarize_retail_decisions
 
 
@@ -71,49 +69,19 @@ def estimate_empty_space(boxes, img_w, img_h, max_dim=640):
     return 1.0 - coverage, coverage
 
 
-def decide_backend_action(pred: dict, user_requested_llava: bool = False, fine_grained: bool = False) -> dict:
+def decide_backend_action(pred: dict) -> dict:
     top1 = float(pred.get("confidence", 0.0))
     gap = float(pred.get("confidence_gap", 0.0))
 
-    if fine_grained:
-        return {
-            "action": "call_llava_now",
-            "reason": "user_requested_fine_grained",
-            "should_call_llava4": True,
-        }
-
-    if user_requested_llava:
-        return {
-            "action": "call_llava_now",
-            "reason": "user_requested_llava4",
-            "should_call_llava4": True,
-        }
-
     if top1 >= 0.80 and gap >= 0.20:
         return {
-            "action": "accept_efficientnet",
+            "action": "accept_swin_faiss",
             "reason": "high_confidence_and_clear_margin",
-            "should_call_llava4": False,
-        }
-
-    if top1 >= 0.60 and gap < 0.20:
-        return {
-            "action": "defer_to_user",
-            "reason": "uncertain_small_margin",
-            "should_call_llava4": False,
-        }
-
-    if 0.60 <= top1 < 0.80:
-        return {
-            "action": "defer_to_user",
-            "reason": "medium_confidence",
-            "should_call_llava4": False,
         }
 
     return {
-        "action": "call_llava_now",
-        "reason": "low_confidence",
-        "should_call_llava4": True,
+        "action": "defer_to_user",
+        "reason": "use_swin_faiss",
     }
 
 
@@ -162,6 +130,7 @@ def process_image(input_image, question):
         t_before_swin = time.time()
         swin_result = None
         final_category = "unknown"
+        subcategory_label = "unknown"
         clip_result = None
         unknown_path = None
 
@@ -179,59 +148,20 @@ def process_image(input_image, question):
                 if _is_valid_label(swin_cat):
                     final_category = swin_cat
                 else:
-                    candidates = swin_result.get("candidate_labels", [])
-                    if candidates:
-                        try:
-                            t_before_clip = time.time()
-                            clip_result = classify_with_clip_pil(crop, candidates)
-                            t_clip = time.time()
-                            print(f"[timing] crop {i} CLIP took {t_clip - t_before_clip:.3f}s")
-                            clip_label = (clip_result or {}).get("label") if isinstance(clip_result, dict) else None
-                            clip_score = float((clip_result or {}).get("score") or 0.0)
-                            if clip_label and clip_label != "unknown" and clip_score >= 0.18:
-                                final_category = clip_label
-                            else:
-                                final_category = "unknown"
-                        except Exception as clip_exc:
-                            print(f"[warning] crop {i} CLIP failed: {clip_exc}")
-                            final_category = "unknown"
-                    else:
-                        final_category = "unknown"
+                    final_category = "unknown"
+
+                if _is_valid_label(swin_subcat):
+                    subcategory_label = swin_subcat
+                else:
+                    subcategory_label = "unknown"
             except Exception as swin_exc:
                 print(f"[warning] crop {i} Swin FAISS failed: {swin_exc}")
                 final_category = "unknown"
+                subcategory_label = "unknown"
         else:
             print("[warning] Swin FAISS classifier not ready; marking crop as unknown")
             final_category = "unknown"
-
-        llava_sub_result = {"answer": None}
-        subcategory_label = "unknown"
-        if final_category != "unknown":
-            swin_best_sub = None
-            try:
-                swin_best_sub = (
-                    swin_result or {}
-                ).get("predicted_subcategory") or (swin_result or {}).get("best_subcategory")
-            except Exception:
-                swin_best_sub = None
-
-            if swin_best_sub and _is_valid_label(swin_best_sub):
-                subcategory_label = swin_best_sub
-            else:
-                try:
-                    t_before_sub = time.time()
-                    llava_sub_result = generate_llava4_answer(
-                        image=crop,
-                        broad_category=final_category,
-                        user_prompt=None,
-                    )
-                    t_sub = time.time()
-                    print(f"[timing] crop {i} LLaVA4(subcategory) took {t_sub - t_before_sub:.3f}s")
-                    if isinstance(llava_sub_result, dict) and llava_sub_result.get("answer"):
-                        subcategory_label = llava_sub_result.get("answer")
-                except Exception as sub_exc:
-                    llava_sub_result = {"error": "llava4_failed", "details": str(sub_exc)}
-                    subcategory_label = "unknown"
+            subcategory_label = "unknown"
 
         t_before_retail = time.time()
         retail_product = resolve_retail_product(
@@ -244,13 +174,6 @@ def process_image(input_image, question):
         print(f"[timing] crop {i} retail product resolver took {t_retail - t_before_retail:.3f}s")
 
         retail_decision = retail_product.get("decision") or {}
-        ocr_info = retail_product.get("ocr") or {}
-        reasoner_info = retail_product.get("reasoner") or {}
-        print(
-            "[debug] crop "
-            f"{i} EasyOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
-            f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
-        )
         if retail_decision.get("category") and retail_decision.get("category") != "unknown":
             final_category = retail_decision["category"]
         if retail_decision.get("subcategory") and retail_decision.get("subcategory") != "unknown":
@@ -269,8 +192,8 @@ def process_image(input_image, question):
                 "product_category": final_category,
                 "subcategory": subcategory_label,
                 "swin": swin_result,
-                "clip": clip_result,
-                "llava_subcategory": llava_sub_result,
+                "clip": None,
+                "llava_subcategory": {"answer": None, "status": "disabled"},
                 "retail_product": retail_product,
             }
         )
@@ -319,15 +242,8 @@ def process_image(input_image, question):
         )
 
     if rows:
-        ocr_available = sum(1 for r in rows if ((r.get("retail_product") or {}).get("ocr") or {}).get("available"))
-        reasoner_used = sum(
-            1
-            for r in rows
-            if (((r.get("retail_product") or {}).get("reasoner") or {}).get("provider") == "hf")
-        )
         summary_lines.append(
-            f"<p><strong>Resolver stack:</strong> EasyOCR read text for {ocr_available}/{len(rows)} crop"
-            f"{'s' if len(rows) != 1 else ''}; Llama reasoning used for {reasoner_used}/{len(rows)}.</p>"
+            f"<p><strong>Resolver stack:</strong> SWIN + FAISS classification used for {len(rows)} crop{'s' if len(rows) != 1 else ''}.</p>"
         )
 
     if unknown_items:
