@@ -41,10 +41,26 @@ This project provides a Gradio UI for shelf image upload, YOLO-based crop detect
 - YOLO_CONFIG_DIR=/tmp/Ultralytics
 - HF_HOME=/workspace/.cache/huggingface
 - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+- PADDLE_OCR_LANG=en
+- PADDLE_OCR_USE_GPU=0
+- PRELOAD_PADDLE_OCR=1
+- OLLAMA_AUTOSTART=1
+- OLLAMA_MODELS=/workspace/.ollama/models
+- RETAIL_REASONER_PROVIDER=ollama
+- RETAIL_REASONER_MODEL=llama3.1:8b
+- LLAMA_BASE_URL=http://127.0.0.1:11434
+- LLAMA_MODEL=llama3.1:8b
+
+For Hugging Face Transformers instead of Ollama, set:
+
+- RETAIL_REASONER_PROVIDER=hf
+- LLAMA_MODEL_ID=meta-llama/Meta-Llama-3.1-8B-Instruct
+- HF_TOKEN=<token with access to the Meta Llama model>
 
 ## Notes
 
 - The Gradio app is configured to bind to 0.0.0.0 and reads PORT.
 - YOLO model path in app.py points to models/yolo/best.pt.
+- The Docker entrypoint starts Ollama, pulls LLAMA_MODEL, preloads PaddleOCR models, then starts app.py.
 - If model artifacts are large, use Git LFS or pull model files from remote storage at startup.
-- Each crop is resolved with Swin/FAISS candidates and a heuristic retail-product decision. OCR and retail SLM reranking are not part of the current flow.
+- Each crop is resolved with PaddleOCR text, Swin/FAISS visual candidates, and optional Llama 3.1 8B Instruct text reasoning. If OCR or Llama is unavailable, the app falls back to a Swin/FAISS heuristic decision.

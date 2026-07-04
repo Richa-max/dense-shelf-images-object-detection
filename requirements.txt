@@ -20,3 +20,5 @@ huggingface_hub
 peft
 einops
 timm
+paddlepaddle
+paddleocr

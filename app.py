@@ -244,6 +244,13 @@ def process_image(input_image, question):
         print(f"[timing] crop {i} retail product resolver took {t_retail - t_before_retail:.3f}s")
 
         retail_decision = retail_product.get("decision") or {}
+        ocr_info = retail_product.get("ocr") or {}
+        reasoner_info = retail_product.get("reasoner") or {}
+        print(
+            "[debug] crop "
+            f"{i} PaddleOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
+            f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
+        )
         if retail_decision.get("category") and retail_decision.get("category") != "unknown":
             final_category = retail_decision["category"]
         if retail_decision.get("subcategory") and retail_decision.get("subcategory") != "unknown":
@@ -309,6 +316,18 @@ def process_image(input_image, question):
         product_lines = [f"{cnt} x {name}" for name, cnt in top_products[:5]]
         summary_lines.append(
             f"<p><strong>Likely products:</strong> {', '.join(product_lines)}</p>"
+        )
+
+    if rows:
+        ocr_available = sum(1 for r in rows if ((r.get("retail_product") or {}).get("ocr") or {}).get("available"))
+        reasoner_used = sum(
+            1
+            for r in rows
+            if (((r.get("retail_product") or {}).get("reasoner") or {}).get("provider") in {"ollama", "hf"})
+        )
+        summary_lines.append(
+            f"<p><strong>Resolver stack:</strong> PaddleOCR read text for {ocr_available}/{len(rows)} crop"
+            f"{'s' if len(rows) != 1 else ''}; Llama reasoning used for {reasoner_used}/{len(rows)}.</p>"
         )
 
     if unknown_items:

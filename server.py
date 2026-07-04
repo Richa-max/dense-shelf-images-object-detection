@@ -101,6 +101,13 @@ def _classify_crop_image(
         category_hint=result_label,
         subcategory_hint=subcategory_label,
     )
+    ocr_info = retail_product.get("ocr") or {}
+    reasoner_info = retail_product.get("reasoner") or {}
+    print(
+        "[debug] classify crop "
+        f"PaddleOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
+        f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
+    )
 
     decision = retail_product.get("decision") or {}
     if decision.get("category") and decision.get("category") != "unknown":
@@ -220,6 +227,13 @@ def classify_crop():
         )
         t_retail = time.time()
         print(f"[timing] retail product resolver took {t_retail - t_before_retail:.3f}s")
+        ocr_info = retail_product.get("ocr") or {}
+        reasoner_info = retail_product.get("reasoner") or {}
+        print(
+            "[debug] classify_crop "
+            f"PaddleOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
+            f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
+        )
 
         decision = retail_product.get("decision") or {}
         if decision.get("category") and decision.get("category") != "unknown":
