@@ -252,6 +252,27 @@ def process_image(input_image, question):
             }
         )
 
+    unique_cats = {}
+    unknown_items = []
+    for r in rows:
+        cat = r.get("product_category") or "unknown"
+        unique_cats[cat] = unique_cats.get(cat, 0) + 1
+        if cat.lower() == "unknown":
+            unknown_items.append(r["crop_id"])
+
+    total_items = len(rows)
+    distinct_categories = len([cat for cat in unique_cats.keys() if cat.lower() != "unknown"])
+    shelf_type = "Unknown"
+    if distinct_categories == 1:
+        shelf_type = "Category-specific"
+    elif distinct_categories > 1:
+        shelf_type = "Mixed"
+
+    category_lines = []
+    if unique_cats:
+        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
+        category_lines = [f"{cnt} x {cat}" for cat, cnt in sorted_cats[:5]]
+
     summary_html = _build_summary_html(rows, empty_ratio, empty_label)
 
     list_html = "<h4>Detected items</h4>"
