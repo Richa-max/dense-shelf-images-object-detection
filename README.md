@@ -39,15 +39,10 @@ This project provides a Gradio UI for shelf image upload, YOLO-based crop detect
 - PORT=7860
 - HF_HOME=/workspace/.cache/huggingface
 - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
-- OCR_BACKEND=auto
-- OCR_LANGS=en
-- RETAIL_SLM_PROVIDER=ollama
-- RETAIL_SLM_MODEL=llama3.2:3b
-- DISABLE_RETAIL_SLM=0
 
 ## Notes
 
 - The Gradio app is configured to bind to 0.0.0.0 and reads PORT.
 - YOLO model path in app.py points to models/yolo/best.pt.
 - If model artifacts are large, use Git LFS or pull model files from remote storage at startup.
-- Each crop is now resolved with OCR text, FAISS candidates, and an optional local retail SLM reranker. If no OCR or SLM backend is available, the app still returns a heuristic FAISS-based decision.
+- Each crop is resolved with Swin/FAISS candidates and a heuristic retail-product decision. OCR and retail SLM reranking are not part of the current flow.

@@ -239,19 +239,11 @@ def process_image(input_image, question):
             swin_result=swin_result,
             category_hint=final_category,
             subcategory_hint=subcategory_label,
-            disable_slm=os.getenv("DISABLE_RETAIL_SLM", "0").strip().lower() in {"1", "true", "yes"},
         )
         t_retail = time.time()
-        print(f"[timing] crop {i} retail OCR/SLM resolver took {t_retail - t_before_retail:.3f}s")
+        print(f"[timing] crop {i} retail product resolver took {t_retail - t_before_retail:.3f}s")
 
         retail_decision = retail_product.get("decision") or {}
-        ocr_info = retail_product.get("ocr") or {}
-        slm_info = retail_product.get("slm") or {}
-        print(
-            "[debug] crop "
-            f"{i} OCR backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
-            f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
-        )
         if retail_decision.get("category") and retail_decision.get("category") != "unknown":
             final_category = retail_decision["category"]
         if retail_decision.get("subcategory") and retail_decision.get("subcategory") != "unknown":
@@ -317,19 +309,6 @@ def process_image(input_image, question):
         product_lines = [f"{cnt} x {name}" for name, cnt in top_products[:5]]
         summary_lines.append(
             f"<p><strong>Likely products:</strong> {', '.join(product_lines)}</p>"
-        )
-
-    ocr_attempted = sum(1 for r in rows if (r.get("retail_product") or {}).get("ocr"))
-    ocr_available = sum(1 for r in rows if ((r.get("retail_product") or {}).get("ocr") or {}).get("available"))
-    slm_used = sum(
-        1
-        for r in rows
-        if (((r.get("retail_product") or {}).get("slm") or {}).get("source") not in {None, "", "heuristic"})
-    )
-    if rows:
-        summary_lines.append(
-            f"<p><strong>OCR/SLM status:</strong> OCR available for {ocr_available}/{ocr_attempted} crop"
-            f"{'s' if ocr_attempted != 1 else ''}; retail SLM used for {slm_used}/{len(rows)}.</p>"
         )
 
     if unknown_items:

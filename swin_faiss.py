@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel
+#test
 
 try:
     import faiss

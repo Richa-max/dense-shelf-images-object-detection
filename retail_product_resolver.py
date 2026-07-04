@@ -1,15 +1,8 @@
-import json
-import os
 import re
 from collections import Counter
 from typing import Dict, List, Optional
 
-import requests
-import numpy as np
-from PIL import Image, ImageOps
-
-
-_EASYOCR_READER = None
+from PIL import Image
 
 
 def _clean_text(value: Optional[str]) -> str:
@@ -41,83 +34,6 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
-
-
-def _ocr_with_easyocr(image: Image.Image) -> Dict:
-    global _EASYOCR_READER
-    import easyocr
-
-    if _EASYOCR_READER is None:
-        langs = [
-            lang.strip()
-            for lang in os.getenv("OCR_LANGS", "en").split(",")
-            if lang.strip()
-        ]
-        _EASYOCR_READER = easyocr.Reader(langs, gpu=os.getenv("OCR_GPU", "0") in {"1", "true", "yes"})
-
-    rgb = np.array(image.convert("RGB"))
-    results = _EASYOCR_READER.readtext(rgb)
-    parts = []
-    words = []
-    for item in results:
-        if len(item) < 3:
-            continue
-        text = _clean_text(item[1])
-        conf = _safe_float(item[2])
-        if not text:
-            continue
-        parts.append(text)
-        words.append({"text": text, "confidence": conf})
-    return {
-        "backend": "easyocr",
-        "text": _clean_text(" ".join(parts)),
-        "words": words,
-        "available": True,
-    }
-
-
-def _ocr_with_pytesseract(image: Image.Image) -> Dict:
-    import pytesseract
-
-    gray = ImageOps.grayscale(image)
-    gray = ImageOps.autocontrast(gray)
-    text = pytesseract.image_to_string(gray)
-    return {
-        "backend": "pytesseract",
-        "text": _clean_text(text),
-        "words": [],
-        "available": True,
-    }
-
-
-def extract_ocr_text(image: Image.Image) -> Dict:
-    """Run OCR if an optional OCR backend is installed.
-
-    The project can still run without OCR dependencies; the response records why
-    OCR was skipped so API clients can distinguish absence from empty labels.
-    """
-    backend = os.getenv("OCR_BACKEND", "auto").strip().lower()
-    if backend in {"0", "false", "off", "none", "disabled"}:
-        return {"backend": "disabled", "text": "", "words": [], "available": False}
-
-    attempts = []
-    candidates = ["easyocr", "pytesseract"] if backend == "auto" else [backend]
-    for candidate in candidates:
-        try:
-            if candidate == "easyocr":
-                return _ocr_with_easyocr(image)
-            if candidate in {"tesseract", "pytesseract"}:
-                return _ocr_with_pytesseract(image)
-        except Exception as exc:
-            attempts.append({"backend": candidate, "error": str(exc)})
-
-    return {
-        "backend": backend,
-        "text": "",
-        "words": [],
-        "available": False,
-        "attempts": attempts,
-    }
 
 
 def _candidate_from_neighbor(neighbor: Dict, rank: int) -> Dict:
@@ -160,16 +76,16 @@ def _build_candidates(swin_result: Optional[Dict], limit: int = 10) -> List[Dict
     return candidates
 
 
-def _score_candidate(candidate: Dict, ocr_text: str) -> float:
-    ocr_tokens = set(_tokens(ocr_text))
+def _score_candidate(candidate: Dict, category_hint: Optional[str], subcategory_hint: Optional[str]) -> float:
+    hint_tokens = set(_tokens(" ".join([category_hint or "", subcategory_hint or ""])))
     fields = " ".join([candidate.get("product_name", ""), candidate.get("category", ""), candidate.get("subcategory", "")])
     cand_tokens = set(_tokens(fields))
-    overlap = len(ocr_tokens & cand_tokens) / max(1, len(cand_tokens))
+    overlap = len(hint_tokens & cand_tokens) / max(1, len(cand_tokens))
     visual = 1.0 / max(1, int(candidate.get("rank") or 1))
-    return round((0.65 * overlap) + (0.35 * visual), 4)
+    return round((0.35 * overlap) + (0.65 * visual), 4)
 
 
-def _heuristic_decision(candidates: List[Dict], ocr_text: str, category_hint: Optional[str], subcategory_hint: Optional[str]) -> Dict:
+def _heuristic_decision(candidates: List[Dict], category_hint: Optional[str], subcategory_hint: Optional[str]) -> Dict:
     if not candidates:
         return {
             "predicted_product": "unknown",
@@ -185,87 +101,27 @@ def _heuristic_decision(candidates: List[Dict], ocr_text: str, category_hint: Op
         [
             {
                 **candidate,
-                "combined_score": _score_candidate(candidate, ocr_text),
+                "combined_score": _score_candidate(candidate, category_hint, subcategory_hint),
             }
             for candidate in candidates
         ],
         key=lambda item: (-item["combined_score"], item["rank"]),
     )
     best = ranked[0]
-    ocr_available = bool(_tokens(ocr_text))
     confidence = 0.72 if best["rank"] == 1 else 0.58
-    if ocr_available and best["combined_score"] >= 0.35:
-        confidence = min(0.95, confidence + 0.18)
-    elif ocr_available:
-        confidence = min(0.85, confidence + 0.06)
-
-    brand = "unknown"
-    text_tokens = _tokens(ocr_text)
-    if text_tokens:
-        brand = text_tokens[0].upper()
+    if best["combined_score"] >= 0.55:
+        confidence = min(0.9, confidence + 0.08)
 
     return {
         "predicted_product": _product_like_name(best.get("product_name"), best.get("category"), best.get("subcategory")) or "unknown",
-        "brand": brand,
+        "brand": "unknown",
         "category": best.get("category") or category_hint or "unknown",
         "subcategory": best.get("subcategory") or subcategory_hint or "unknown",
         "confidence": round(confidence, 3),
-        "reason": "Ranked FAISS candidates using OCR token overlap and visual rank.",
+        "reason": "Ranked FAISS candidates using visual rank and category hints.",
         "source": "heuristic",
         "ranked_candidates": ranked[:5],
     }
-
-
-def _extract_json_object(text: str) -> Optional[Dict]:
-    if not text:
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        parsed = json.loads(text[start : end + 1])
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
-
-
-def _call_ollama_retail_slm(ocr_text: str, candidates: List[Dict], category_hint: Optional[str], subcategory_hint: Optional[str]) -> Dict:
-    base_url = os.getenv("RETAIL_SLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
-    model = os.getenv("RETAIL_SLM_MODEL", os.getenv("OLLAMA_MODEL", "llama3.2:3b"))
-    payload = {
-        "model": model,
-        "stream": False,
-        "prompt": (
-            "You are a retail product identification model. Use OCR text and FAISS candidates; "
-            "do not invent products outside the evidence. Return JSON only with keys: "
-            "predicted_product, brand, category, subcategory, confidence, reason.\n\n"
-            f"OCR text: {ocr_text or '(none)'}\n"
-            f"Category hint: {category_hint or 'unknown'}\n"
-            f"Subcategory hint: {subcategory_hint or 'unknown'}\n"
-            f"FAISS candidates: {json.dumps(candidates[:10], ensure_ascii=False)}"
-        ),
-        "options": {"temperature": 0.0, "num_predict": int(os.getenv("RETAIL_SLM_MAX_TOKENS", "256"))},
-    }
-    response = requests.post(f"{base_url}/api/generate", json=payload, timeout=90)
-    response.raise_for_status()
-    data = response.json()
-    raw = data.get("response", "")
-    parsed = _extract_json_object(raw) or {}
-    parsed.setdefault("source", "ollama")
-    parsed.setdefault("model", model)
-    parsed.setdefault("raw_response", raw)
-    return parsed
-
-
-def _normalize_decision(decision: Dict, fallback: Dict) -> Dict:
-    normalized = dict(fallback)
-    if isinstance(decision, dict):
-        normalized.update({k: v for k, v in decision.items() if v not in (None, "")})
-    normalized["confidence"] = max(0.0, min(1.0, _safe_float(normalized.get("confidence"), fallback.get("confidence", 0.0))))
-    for key in ["predicted_product", "brand", "category", "subcategory", "reason", "source"]:
-        normalized[key] = _clean_text(normalized.get(key)) or fallback.get(key) or "unknown"
-    return normalized
 
 
 def resolve_retail_product(
@@ -273,32 +129,13 @@ def resolve_retail_product(
     swin_result: Optional[Dict],
     category_hint: Optional[str] = None,
     subcategory_hint: Optional[str] = None,
-    disable_slm: bool = False,
 ) -> Dict:
-    ocr = extract_ocr_text(image)
-    ocr_text = ocr.get("text", "")
     candidates = _build_candidates(swin_result)
-    fallback = _heuristic_decision(candidates, ocr_text, category_hint, subcategory_hint)
-
-    slm_result = None
-    provider = os.getenv("RETAIL_SLM_PROVIDER", "none").strip().lower()
-    if not disable_slm and provider in {"ollama", "local_ollama"}:
-        try:
-            slm_result = _call_ollama_retail_slm(ocr_text, candidates, category_hint, subcategory_hint)
-            decision = _normalize_decision(slm_result, fallback)
-        except Exception as exc:
-            slm_result = {"error": "retail_slm_failed", "details": str(exc), "provider": provider}
-            decision = fallback
-    else:
-        reason = "disabled" if disable_slm else f"provider_not_configured:{provider}"
-        slm_result = {"status": "skipped", "reason": reason}
-        decision = fallback
+    decision = _heuristic_decision(candidates, category_hint, subcategory_hint)
 
     return {
-        "ocr": ocr,
         "faiss_candidates": candidates,
         "decision": decision,
-        "slm": slm_result,
     }
 
 

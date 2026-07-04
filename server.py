@@ -53,7 +53,6 @@ def _classify_crop_image(
     img: Image.Image,
     disable_llava: bool = False,
     llava_prompt: str = None,
-    disable_retail_slm: bool = False,
 ) -> dict:
     if not swin_classifier.is_ready():
         raise RuntimeError("Swin FAISS classifier is not ready")
@@ -101,14 +100,6 @@ def _classify_crop_image(
         swin_result=swin_result,
         category_hint=result_label,
         subcategory_hint=subcategory_label,
-        disable_slm=disable_retail_slm,
-    )
-    ocr_info = retail_product.get("ocr") or {}
-    slm_info = retail_product.get("slm") or {}
-    print(
-        "[debug] classify crop OCR "
-        f"backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
-        f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
     )
 
     decision = retail_product.get("decision") or {}
@@ -144,7 +135,6 @@ def classify_crop():
     user_requested_llava = _to_bool(request.form.get("user_requested_llava"))
     fine_grained = _to_bool(request.form.get("fine_grained"))
     disable_llava = _to_bool(request.form.get("disable_llava"))
-    disable_retail_slm = _to_bool(request.form.get("disable_retail_slm"))
     llava_prompt = request.form.get("llava_prompt")
     # CLIP subcategory options: either provide a JSON list in 'subcategories'
     # or send newline-separated values. Also accepts boolean 'use_clip'.
@@ -227,17 +217,9 @@ def classify_crop():
             swin_result=swin_result,
             category_hint=result_label,
             subcategory_hint=subcategory_label,
-            disable_slm=disable_retail_slm,
         )
         t_retail = time.time()
-        print(f"[timing] retail OCR/SLM resolver took {t_retail - t_before_retail:.3f}s")
-        ocr_info = retail_product.get("ocr") or {}
-        slm_info = retail_product.get("slm") or {}
-        print(
-            "[debug] classify_crop OCR "
-            f"backend={ocr_info.get('backend')} available={ocr_info.get('available')} "
-            f"text={ocr_info.get('text')!r} SLM={slm_info.get('source') or slm_info.get('status') or slm_info.get('error')}"
-        )
+        print(f"[timing] retail product resolver took {t_retail - t_before_retail:.3f}s")
 
         decision = retail_product.get("decision") or {}
         if decision.get("category") and decision.get("category") != "unknown":
@@ -268,7 +250,6 @@ def classify_shelf():
         return jsonify({"error": "cannot open image", "details": str(e)}), 400
 
     disable_llava = _to_bool(request.form.get("disable_llava"))
-    disable_retail_slm = _to_bool(request.form.get("disable_retail_slm"))
     llava_prompt = request.form.get("llava_prompt")
 
     if not swin_classifier.is_ready():
@@ -286,7 +267,6 @@ def classify_shelf():
                 crop,
                 disable_llava=disable_llava,
                 llava_prompt=llava_prompt,
-                disable_retail_slm=disable_retail_slm,
             )
             items.append(
                 {

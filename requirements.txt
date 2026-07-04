@@ -20,5 +20,3 @@ huggingface_hub
 peft
 einops
 timm
-easyocr
-pytesseract
