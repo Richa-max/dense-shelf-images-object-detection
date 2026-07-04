@@ -6,6 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/workspace/.cache/huggingface \
     TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
+    YOLO_CONFIG_DIR=/tmp/Ultralytics \
+    GRADIO_SERVER_NAME=0.0.0.0 \
     PORT=7860
 
 WORKDIR /workspace/app

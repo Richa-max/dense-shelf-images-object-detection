@@ -37,6 +37,8 @@ This project provides a Gradio UI for shelf image upload, YOLO-based crop detect
 ## Recommended Environment Variables
 
 - PORT=7860
+- GRADIO_SERVER_NAME=0.0.0.0
+- YOLO_CONFIG_DIR=/tmp/Ultralytics
 - HF_HOME=/workspace/.cache/huggingface
 - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
 
