@@ -51,7 +51,7 @@ This project provides a Gradio UI for shelf image upload, YOLO-based crop detect
 - LLAMA_MODEL_ID=meta-llama/Meta-Llama-3.1-8B-Instruct
 - HF_TOKEN=<token with access to the Meta Llama model>
 - LLAMA_DEVICE_MAP=auto
-- LLAMA_LOAD_IN_4BIT=0
+- LLAMA_LOAD_IN_4BIT=1
 
 ## Notes
 

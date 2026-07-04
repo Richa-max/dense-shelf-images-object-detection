@@ -157,9 +157,9 @@ def _score_candidate(
     hint_tokens = set(_tokens(" ".join([category_hint or "", subcategory_hint or ""])))
     ocr_tokens = set(_tokens(ocr_text))
     fields = " ".join([candidate.get("product_name", ""), candidate.get("category", ""), candidate.get("subcategory", "")])
-    cand_tokens = set(_tokens(fields))
-    hint_overlap = len(hint_tokens & cand_tokens) / max(1, len(cand_tokens))
-    ocr_overlap = len(ocr_tokens & cand_tokens) / max(1, len(cand_tokens))
+    candidate_tokens = set(_tokens(fields))
+    hint_overlap = len(hint_tokens & candidate_tokens) / max(1, len(candidate_tokens))
+    ocr_overlap = len(ocr_tokens & candidate_tokens) / max(1, len(candidate_tokens))
     visual = 1.0 / max(1, int(candidate.get("rank") or 1))
     return round((0.2 * hint_overlap) + (0.35 * ocr_overlap) + (0.45 * visual), 4)
 
@@ -289,7 +289,7 @@ def _call_hf_llama(prompt: str) -> Dict:
 
     output = model.generate(
         **inputs,
-        max_new_tokens=int(os.getenv("LLAMA_MAX_NEW_TOKENS", "256")),
+        max_new_tokens=int(os.getenv("LLAMA_MAX_NEW_TOKENS", "128")),
         do_sample=False,
         pad_token_id=tokenizer.eos_token_id,
     )
@@ -359,7 +359,6 @@ def resolve_retail_product(
     candidates = _build_candidates(swin_result)
     fallback = _heuristic_decision(candidates, category_hint, subcategory_hint, ocr_text)
 
-    reasoner = None
     try:
         reasoner = _reason_with_llama(ocr_text, candidates, category_hint, subcategory_hint)
         if isinstance(reasoner, dict) and reasoner.get("status") != "skipped" and not reasoner.get("error"):

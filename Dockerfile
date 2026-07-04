@@ -17,6 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RETAIL_REASONER_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct \
     LLAMA_MODEL_ID=meta-llama/Meta-Llama-3.1-8B-Instruct \
     LLAMA_DEVICE_MAP=auto \
+    LLAMA_LOAD_IN_4BIT=1 \
     PORT=7860
 
 WORKDIR /workspace/app
