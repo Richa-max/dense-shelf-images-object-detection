@@ -8,11 +8,12 @@ import io
 import base64
 import numpy as np
 from ultralytics import YOLO
-
-from swin_faiss import load_swin_faiss_classifier
+import os
 import json
 import time
-import os
+from pathlib import Path
+
+from swin_faiss import load_swin_faiss_classifier
 
 # load default subcategories mapping if present
 _SUBCATS = {}
@@ -84,6 +85,57 @@ def decide_backend_action(pred: dict) -> dict:
         "action": "defer_to_user",
         "reason": "use_swin_faiss",
     }
+
+
+def _build_summary_html(rows, empty_ratio, empty_label):
+    unique_cats = {}
+    unknown_items = []
+    for r in rows:
+        cat = r.get("product_category") or "unknown"
+        unique_cats[cat] = unique_cats.get(cat, 0) + 1
+        if cat.lower() == "unknown":
+            unknown_items.append(r["crop_id"])
+
+    summary_lines = []
+    total_items = len(rows)
+    distinct_categories = len([cat for cat in unique_cats.keys() if cat.lower() != "unknown"])
+    shelf_type = "Unknown"
+    if distinct_categories == 1:
+        shelf_type = "Category-specific"
+    elif distinct_categories > 1:
+        shelf_type = "Mixed"
+
+    summary_lines.append("<h3>Store Management Summary</h3>")
+    summary_lines.append(
+        f"<p>We detected <strong>{total_items}</strong> product{'s' if total_items != 1 else ''} on this shelf. "
+        f"The shelf appears <strong>{shelf_type.lower()}</strong> with {distinct_categories} distinct category{'ies' if distinct_categories != 1 else ''}.</p>"
+    )
+
+    if unique_cats:
+        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
+        category_lines = []
+        for cat, cnt in sorted_cats[:5]:
+            category_lines.append(f"{cnt} x {cat}")
+        summary_lines.append(f"<p><strong>Top categories:</strong> {', '.join(category_lines)}</p>")
+    else:
+        summary_lines.append("<p><strong>Top categories:</strong> none detected yet.</p>")
+
+    retail_summary = summarize_retail_decisions(rows)
+    top_products = retail_summary.get("top_products") or []
+    if top_products:
+        product_lines = [f"{cnt} x {name}" for name, cnt in top_products[:5]]
+        summary_lines.append(f"<p><strong>Likely products:</strong> {', '.join(product_lines)}</p>")
+
+    if rows:
+        summary_lines.append(f"<p><strong>Resolver stack:</strong> SWIN + FAISS classification used for {len(rows)} crop{'s' if len(rows) != 1 else ''}.</p>")
+
+    if unknown_items:
+        summary_lines.append(f"<p><strong>Manual review needed:</strong> {len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may be unclear and should be checked manually.</p>")
+    else:
+        summary_lines.append("<p><strong>Manual review needed:</strong> no unclear items were found.</p>")
+
+    summary_lines.append(f"<p><strong>Estimated visible empty space:</strong> {empty_ratio*100:.0f}% ({empty_label}).</p>")
+    return "\n".join(summary_lines)
 
 
 def process_image(input_image, question):
@@ -200,76 +252,17 @@ def process_image(input_image, question):
             }
         )
 
-    # Build synthesized summary in human-first language
-    unique_cats = {}
-    unknown_items = []
-    for r in rows:
-        cat = r.get("product_category") or "unknown"
-        unique_cats[cat] = unique_cats.get(cat, 0) + 1
-        if cat.lower() == "unknown":
-            unknown_items.append(r["crop_id"])
+    summary_html = _build_summary_html(rows, empty_ratio, empty_label)
 
-    summary_lines = []
-    total_items = len(rows)
-    distinct_categories = len([cat for cat in unique_cats.keys() if cat.lower() != "unknown"])
-    shelf_type = "Unknown"
-    if distinct_categories == 1:
-        shelf_type = "Category-specific"
-    elif distinct_categories > 1:
-        shelf_type = "Mixed"
-
-    summary_lines.append("<h3>Store Management Summary</h3>")
-    summary_lines.append(
-        f"<p>We detected <strong>{total_items}</strong> product{'s' if total_items != 1 else ''} on this shelf. "
-        f"The shelf appears <strong>{shelf_type.lower()}</strong> with {distinct_categories} distinct category{'ies' if distinct_categories != 1 else ''}.</p>"
-    )
-
-    if unique_cats:
-        sorted_cats = sorted(unique_cats.items(), key=lambda x: -x[1])
-        category_lines = []
-        for cat, cnt in sorted_cats[:5]:
-            category_lines.append(f"{cnt} x {cat}")
-        summary_lines.append(
-            f"<p><strong>Top categories:</strong> {', '.join(category_lines)}</p>"
-        )
-    else:
-        summary_lines.append("<p><strong>Top categories:</strong> none detected yet.</p>")
-
-    retail_summary = summarize_retail_decisions(rows)
-    top_products = retail_summary.get("top_products") or []
-    if top_products:
-        product_lines = [f"{cnt} x {name}" for name, cnt in top_products[:5]]
-        summary_lines.append(
-            f"<p><strong>Likely products:</strong> {', '.join(product_lines)}</p>"
-        )
-
+    list_html = "<h4>Detected items</h4>"
     if rows:
-        summary_lines.append(
-            f"<p><strong>Resolver stack:</strong> SWIN + FAISS classification used for {len(rows)} crop{'s' if len(rows) != 1 else ''}.</p>"
-        )
-
-    if unknown_items:
-        summary_lines.append(
-            f"<p><strong>Manual review needed:</strong> {len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may be unclear and should be checked manually.</p>"
-        )
-    else:
-        summary_lines.append("<p><strong>Manual review needed:</strong> no unclear items were found.</p>")
-
-    summary_lines.append(
-        f"<p><strong>Estimated visible empty space:</strong> {empty_ratio*100:.0f}% ({empty_label}).</p>"
-    )
-
-    summary_lines.append("<h4>Detected items</h4>")
-    if rows:
-        summary_lines.append("<ol>")
+        list_html += "<details open><summary>Show / hide detected items</summary><ol>"
         for r in rows:
             cid = r["crop_id"]
             cat = r.get("product_category") or "unknown"
             sub = r.get("subcategory") or "unknown"
             if cat.lower() == "unknown":
-                summary_lines.append(
-                    f"<li>Item {cid} could not be confidently identified and should be reviewed.</li>"
-                )
+                list_html += f"<li>Item {cid} could not be confidently identified and should be reviewed.</li>"
             else:
                 retail_decision = (r.get("retail_product") or {}).get("decision") or {}
                 product = retail_decision.get("predicted_product")
@@ -280,14 +273,12 @@ def process_image(input_image, question):
                 confidence_suffix = ""
                 if isinstance(confidence, (int, float)):
                     confidence_suffix = f" ({confidence*100:.0f}% confidence)"
-                summary_lines.append(
-                    f"<li>Item {cid} is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.</li>"
-                )
-        summary_lines.append("</ol>")
+                list_html += f"<li>Item {cid} is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.</li>"
+        list_html += "</ol></details>"
     else:
-        summary_lines.append("<p>No product items were found in the image.</p>")
+        list_html += "<p>No product items were found in the image.</p>"
 
-    summary_html = "\n".join(summary_lines)
+    summary_html = f"{summary_html}\n{list_html}"
 
     question_answers = {
         "How many products were detected on this shelf?": (
@@ -318,20 +309,20 @@ def process_image(input_image, question):
 
 def inspect_selected_crop(selected_crop_id, rows_state):
     if not rows_state:
-        return "<p>No detected boxes are available yet.</p>"
+        return None, "<p>No detected boxes are available yet.</p>"
     try:
         crop_id = int(selected_crop_id)
     except (TypeError, ValueError):
-        return "<p>Please select a detected box first.</p>"
+        return None, "<p>Please select a detected box first.</p>"
 
     for row in rows_state:
         if int(row.get("crop_id", -1)) != crop_id:
             continue
         crop_image = row.get("crop_image")
         if crop_image is None:
-            return f"<p>Crop {crop_id} was detected but no image crop is available.</p>"
+            return None, f"<p>Crop {crop_id} was detected but no image crop is available.</p>"
         prompt = (
-            "Identify the exact SKU, product name, or brand visible in this crop. "
+            "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
             "Return a short answer only."
         )
         result = generate_llava4_answer(
@@ -341,10 +332,42 @@ def inspect_selected_crop(selected_crop_id, rows_state):
         )
         answer = (result.get("answer") or "").strip()
         if not answer:
-            answer = result.get("error") or "No SKU was detected."
-        return f"<p><b>Selected box {crop_id}</b><br>{answer}</p>"
+            answer = result.get("error") or "No product detail was detected."
+        return crop_image, f"<p><b>Selected box {crop_id}</b><br>{answer}</p>"
 
-    return f"<p>No detected box with id {crop_id} was found.</p>"
+    return None, f"<p>No detected box with id {crop_id} was found.</p>"
+
+
+def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
+    if not rows_state:
+        return "<p>No detected boxes are available yet.</p>", None
+    try:
+        crop_id = int(selected_crop_id)
+    except (TypeError, ValueError):
+        return "<p>Please select a detected box first.</p>", None
+
+    for row in rows_state:
+        if int(row.get("crop_id", -1)) != crop_id:
+            continue
+        crop_image = row.get("crop_image")
+        if crop_image is None:
+            return "<p>No crop image is available to save.</p>", None
+        out_dir = Path("flagged_crops")
+        out_dir.mkdir(exist_ok=True)
+        filename = f"crop_{crop_id}_{int(time.time())}.png"
+        path = out_dir / filename
+        crop_image.save(path)
+        meta = {
+            "crop_id": crop_id,
+            "flag_reason": flag_reason or "unknown",
+            "saved_path": str(path),
+            "timestamp": int(time.time()),
+        }
+        with open(out_dir / "flags.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta) + "\n")
+        return f"<p>Saved flagged crop to <b>{path}</b>.</p>", str(path)
+
+    return f"<p>No detected box with id {crop_id} was found.</p>", None
 
 
 with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
@@ -370,7 +393,15 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
     with gr.Row():
         crop_selector = gr.Dropdown(choices=[], label="Select a detected box to inspect")
         inspect_button = gr.Button("Inspect selected box with LLaVA")
-    output_sku = gr.HTML(label="SKU / product detail")
+    with gr.Row():
+        crop_preview = gr.Image(type="pil", label="Selected crop preview")
+        output_sku = gr.HTML(label="Category / subcategory / SKU detail")
+    with gr.Row():
+        flag_reason = gr.Textbox(label="Flag reason if SKU is unclear", placeholder="e.g. blurry, occluded, no visible barcode")
+        save_button = gr.Button("Flag and save selected crop")
+    with gr.Row():
+        flagged_output = gr.HTML(label="Flag / save status")
+        download_flagged_crop = gr.File(label="Download saved flagged crop")
     rows_state = gr.State(value=[])
 
     analyze_button.click(
@@ -381,7 +412,12 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
     inspect_button.click(
         inspect_selected_crop,
         inputs=[crop_selector, rows_state],
-        outputs=[output_sku],
+        outputs=[crop_preview, output_sku],
+    )
+    save_button.click(
+        save_flagged_crop,
+        inputs=[crop_selector, rows_state, flag_reason, gr.State(value=True)],
+        outputs=[flagged_output, download_flagged_crop],
     )
 
 if __name__ == "__main__":
