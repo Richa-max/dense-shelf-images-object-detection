@@ -5,11 +5,10 @@ from collections import Counter
 from typing import Dict, List, Optional
 
 import numpy as np
-import requests
 from PIL import Image
 
 
-_PADDLE_OCR = None
+_EASYOCR_READER = None
 _LLAMA_TOKENIZER = None
 _LLAMA_MODEL = None
 
@@ -51,86 +50,57 @@ def _to_bool(value: Optional[str], default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _extract_paddle_lines(result) -> List[Dict]:
+def _extract_easyocr_lines(result) -> List[Dict]:
     lines = []
-
-    def visit(node):
-        if node is None:
-            return
-        if isinstance(node, dict):
-            texts = node.get("rec_texts")
-            scores = node.get("rec_scores") or []
-            if isinstance(texts, list):
-                for idx, text in enumerate(texts):
-                    cleaned = _clean_text(text)
-                    if cleaned:
-                        lines.append(
-                            {
-                                "text": cleaned,
-                                "confidence": _safe_float(scores[idx] if idx < len(scores) else None),
-                            }
-                        )
-                return
-            if "text" in node:
-                cleaned = _clean_text(node.get("text"))
-                if cleaned:
-                    lines.append({"text": cleaned, "confidence": _safe_float(node.get("score"))})
-                return
-            for value in node.values():
-                visit(value)
-            return
-        if isinstance(node, (list, tuple)):
-            if len(node) >= 2 and isinstance(node[1], (list, tuple)) and node[1]:
-                text = node[1][0]
-                confidence = node[1][1] if len(node[1]) > 1 else None
-                cleaned = _clean_text(text)
-                if cleaned:
-                    lines.append({"text": cleaned, "confidence": _safe_float(confidence)})
-                    return
-            for value in node:
-                visit(value)
-
-    visit(result)
+    for item in result or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        cleaned = _clean_text(item[1])
+        if not cleaned:
+            continue
+        confidence = item[2] if len(item) > 2 else None
+        lines.append({"text": cleaned, "confidence": _safe_float(confidence)})
     return lines
 
 
-def extract_paddle_ocr_text(image: Image.Image) -> Dict:
-    global _PADDLE_OCR
+def extract_easyocr_text(image: Image.Image) -> Dict:
+    global _EASYOCR_READER
 
-    if _to_bool(os.getenv("DISABLE_PADDLE_OCR"), default=False):
-        return {"backend": "paddleocr", "available": False, "text": "", "lines": [], "status": "disabled"}
+    if _to_bool(os.getenv("DISABLE_EASYOCR"), default=False):
+        return {"backend": "easyocr", "available": False, "text": "", "lines": [], "status": "disabled"}
 
     try:
-        from paddleocr import PaddleOCR
+        import easyocr
 
-        if _PADDLE_OCR is None:
-            lang = os.getenv("PADDLE_OCR_LANG", "en")
-            use_angle_cls = _to_bool(os.getenv("PADDLE_OCR_USE_ANGLE_CLS"), default=True)
-            use_gpu = _to_bool(os.getenv("PADDLE_OCR_USE_GPU"), default=False)
-            try:
-                _PADDLE_OCR = PaddleOCR(use_angle_cls=use_angle_cls, lang=lang, use_gpu=use_gpu, show_log=False)
-            except TypeError:
-                _PADDLE_OCR = PaddleOCR(use_angle_cls=use_angle_cls, lang=lang)
+        if _EASYOCR_READER is None:
+            langs = [
+                lang.strip()
+                for lang in os.getenv("EASYOCR_LANGS", os.getenv("OCR_LANGS", "en")).split(",")
+                if lang.strip()
+            ]
+            model_dir = os.getenv("EASYOCR_MODEL_DIR") or None
+            reader_kwargs = {
+                "gpu": _to_bool(os.getenv("EASYOCR_GPU"), default=False),
+                "verbose": _to_bool(os.getenv("EASYOCR_VERBOSE"), default=False),
+            }
+            if model_dir:
+                reader_kwargs["model_storage_directory"] = model_dir
+                reader_kwargs["user_network_directory"] = model_dir
+            _EASYOCR_READER = easyocr.Reader(langs, **reader_kwargs)
 
         rgb = np.array(image.convert("RGB"))
-        if hasattr(_PADDLE_OCR, "ocr"):
-            try:
-                result = _PADDLE_OCR.ocr(rgb, cls=_to_bool(os.getenv("PADDLE_OCR_USE_ANGLE_CLS"), default=True))
-            except TypeError:
-                result = _PADDLE_OCR.ocr(rgb)
-        else:
-            result = _PADDLE_OCR.predict(rgb)
-        lines = _extract_paddle_lines(result)
+        result = _EASYOCR_READER.readtext(rgb)
+        lines = _extract_easyocr_lines(result)
         text = _clean_text(" ".join(line["text"] for line in lines))
         return {
-            "backend": "paddleocr",
+            "backend": "easyocr",
             "available": bool(text),
             "text": text,
             "lines": lines,
         }
     except Exception as exc:
         return {
-            "backend": "paddleocr",
+            "backend": "easyocr",
             "available": False,
             "text": "",
             "lines": [],
@@ -232,7 +202,7 @@ def _heuristic_decision(
         "category": best.get("category") or category_hint or "unknown",
         "subcategory": best.get("subcategory") or subcategory_hint or "unknown",
         "confidence": round(confidence, 3),
-        "reason": "Ranked FAISS candidates using visual rank, PaddleOCR text overlap, and category hints.",
+        "reason": "Ranked FAISS candidates using visual rank, EasyOCR text overlap, and category hints.",
         "source": "heuristic",
         "ranked_candidates": ranked[:5],
     }
@@ -272,31 +242,6 @@ def _retail_reasoning_prompt(
     )
 
 
-def _call_ollama_llama(prompt: str) -> Dict:
-    base_url = os.getenv("LLAMA_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
-    model = os.getenv("LLAMA_MODEL", os.getenv("RETAIL_REASONER_MODEL", "llama3.1:8b"))
-    response = requests.post(
-        f"{base_url}/api/generate",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": _safe_float(os.getenv("LLAMA_TEMPERATURE"), 0.0),
-                "num_predict": int(os.getenv("LLAMA_MAX_NEW_TOKENS", "256")),
-            },
-        },
-        timeout=int(os.getenv("LLAMA_TIMEOUT_SECONDS", "120")),
-    )
-    response.raise_for_status()
-    raw = response.json().get("response", "")
-    parsed = _extract_json_object(raw) or {}
-    parsed.setdefault("raw_response", raw)
-    parsed.setdefault("provider", "ollama")
-    parsed.setdefault("model", model)
-    return parsed
-
-
 def _load_hf_llama_if_needed():
     global _LLAMA_TOKENIZER, _LLAMA_MODEL
     if _LLAMA_TOKENIZER is not None and _LLAMA_MODEL is not None:
@@ -308,10 +253,16 @@ def _load_hf_llama_if_needed():
     model_id = os.getenv("LLAMA_MODEL_ID", os.getenv("RETAIL_REASONER_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct"))
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     kwargs = {"torch_dtype": dtype}
+    if _to_bool(os.getenv("LLAMA_LOAD_IN_4BIT"), default=False):
+        kwargs["load_in_4bit"] = True
+        kwargs.pop("torch_dtype", None)
     if torch.cuda.is_available():
         kwargs["device_map"] = os.getenv("LLAMA_DEVICE_MAP", "auto")
 
-    _LLAMA_TOKENIZER = AutoTokenizer.from_pretrained(model_id)
+    token = os.getenv("HF_TOKEN") or None
+    _LLAMA_TOKENIZER = AutoTokenizer.from_pretrained(model_id, token=token)
+    if token:
+        kwargs["token"] = token
     _LLAMA_MODEL = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     return _LLAMA_TOKENIZER, _LLAMA_MODEL
 
@@ -351,6 +302,24 @@ def _call_hf_llama(prompt: str) -> Dict:
     return parsed
 
 
+def preload_retail_models() -> Dict:
+    status = {}
+    if _to_bool(os.getenv("PRELOAD_EASYOCR"), default=True):
+        probe = Image.new("RGB", (96, 32), "white")
+        status["easyocr"] = extract_easyocr_text(probe)
+    if _to_bool(os.getenv("PRELOAD_LLAMA"), default=True):
+        try:
+            tokenizer, model = _load_hf_llama_if_needed()
+            status["llama"] = {
+                "provider": "hf",
+                "model": os.getenv("LLAMA_MODEL_ID", os.getenv("RETAIL_REASONER_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")),
+                "loaded": tokenizer is not None and model is not None,
+            }
+        except Exception as exc:
+            status["llama"] = {"error": str(exc)}
+    return status
+
+
 def _normalize_decision(decision: Dict, fallback: Dict) -> Dict:
     normalized = dict(fallback)
     if isinstance(decision, dict):
@@ -369,13 +338,11 @@ def _reason_with_llama(
     category_hint: Optional[str],
     subcategory_hint: Optional[str],
 ) -> Dict:
-    provider = os.getenv("RETAIL_REASONER_PROVIDER", os.getenv("LLAMA_PROVIDER", "ollama")).strip().lower()
+    provider = os.getenv("RETAIL_REASONER_PROVIDER", os.getenv("LLAMA_PROVIDER", "hf")).strip().lower()
     if provider in {"0", "false", "off", "none", "disabled"}:
         return {"status": "skipped", "reason": "provider_disabled", "provider": provider}
 
     prompt = _retail_reasoning_prompt(ocr_text, candidates, category_hint, subcategory_hint)
-    if provider in {"ollama", "local_ollama"}:
-        return _call_ollama_llama(prompt)
     if provider in {"hf", "huggingface", "transformers"}:
         return _call_hf_llama(prompt)
     return {"status": "skipped", "reason": f"unsupported_provider:{provider}", "provider": provider}
@@ -387,7 +354,7 @@ def resolve_retail_product(
     category_hint: Optional[str] = None,
     subcategory_hint: Optional[str] = None,
 ) -> Dict:
-    ocr = extract_paddle_ocr_text(image)
+    ocr = extract_easyocr_text(image)
     ocr_text = ocr.get("text", "")
     candidates = _build_candidates(swin_result)
     fallback = _heuristic_decision(candidates, category_hint, subcategory_hint, ocr_text)

@@ -105,7 +105,7 @@ def _classify_crop_image(
     reasoner_info = retail_product.get("reasoner") or {}
     print(
         "[debug] classify crop "
-        f"PaddleOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
+        f"EasyOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
         f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
     )
 
@@ -231,7 +231,7 @@ def classify_crop():
         reasoner_info = retail_product.get("reasoner") or {}
         print(
             "[debug] classify_crop "
-            f"PaddleOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
+            f"EasyOCR available={ocr_info.get('available')} text={ocr_info.get('text')!r} "
             f"reasoner={reasoner_info.get('provider') or reasoner_info.get('status') or reasoner_info.get('error')}"
         )
 

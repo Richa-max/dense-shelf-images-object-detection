@@ -8,27 +8,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
     YOLO_CONFIG_DIR=/tmp/Ultralytics \
     GRADIO_SERVER_NAME=0.0.0.0 \
-    PADDLE_OCR_LANG=en \
-    PADDLE_OCR_USE_GPU=0 \
-    PRELOAD_PADDLE_OCR=1 \
-    OLLAMA_AUTOSTART=1 \
-    OLLAMA_MODELS=/workspace/.ollama/models \
-    RETAIL_REASONER_PROVIDER=ollama \
-    RETAIL_REASONER_MODEL=llama3.1:8b \
-    LLAMA_MODEL=llama3.1:8b \
+    EASYOCR_LANGS=en \
+    EASYOCR_GPU=1 \
+    EASYOCR_MODEL_DIR=/workspace/.cache/easyocr \
+    PRELOAD_EASYOCR=1 \
+    PRELOAD_LLAMA=1 \
+    RETAIL_REASONER_PROVIDER=hf \
+    RETAIL_REASONER_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct \
+    LLAMA_MODEL_ID=meta-llama/Meta-Llama-3.1-8B-Instruct \
+    LLAMA_DEVICE_MAP=auto \
     PORT=7860
 
 WORKDIR /workspace/app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
     git \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSL https://ollama.com/install.sh | sh
 
 COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
