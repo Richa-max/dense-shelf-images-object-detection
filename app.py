@@ -310,6 +310,7 @@ MAX_CROPS_SKU = int(os.getenv("APP_MAX_CROPS_SKU", "36"))
 MIN_BOX_AREA_RATIO = float(os.getenv("APP_MIN_BOX_AREA_RATIO", "0.00015"))
 OCCUPANCY_ROW_COUNT = int(os.getenv("APP_OCCUPANCY_ROW_COUNT", "4"))
 ANALYTICS_DB_PATH = os.getenv("APP_ANALYTICS_DB_PATH", "shelf_analytics.db")
+LOW_STOCK_FACING_THRESHOLD = int(os.getenv("APP_LOW_STOCK_FACING_THRESHOLD", "2"))
 
 
 def _db_connect():
@@ -337,6 +338,46 @@ def _init_analytics_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sku_detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                store_id TEXT,
+                shelf_id TEXT,
+                crop_id INTEGER,
+                sku_detail TEXT NOT NULL,
+                product_category TEXT,
+                subcategory TEXT,
+                qwen_confidence REAL,
+                semantic_mismatch_flag INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (run_id) REFERENCES shelf_runs(id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_detections_store_shelf ON sku_detections(store_id, shelf_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_detections_created_at ON sku_detections(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_detections_sku ON sku_detections(sku_detail)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sku_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id TEXT NOT NULL DEFAULT '',
+                shelf_id TEXT NOT NULL DEFAULT '',
+                sku_detail TEXT NOT NULL,
+                product_category TEXT NOT NULL DEFAULT 'unknown',
+                subcategory TEXT NOT NULL DEFAULT 'unknown',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                avg_qwen_conf REAL,
+                last_updated INTEGER NOT NULL,
+                UNIQUE(store_id, shelf_id, sku_detail, product_category, subcategory)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_inventory_store_shelf ON sku_inventory(store_id, shelf_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_inventory_qty ON sku_inventory(quantity)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sku_inventory_sku ON sku_inventory(sku_detail)")
 
 
 def _build_mix(rows, key_name):
@@ -347,7 +388,27 @@ def _build_mix(rows, key_name):
     return counts
 
 
+def _is_persistable_sku_label(sku_detail):
+    label = _clean_label(sku_detail).lower()
+    if not label:
+        return False
+    blocked = {
+        "no sku detected",
+        "qwen sku detection not run in analyze shelf mode.",
+        "unknown",
+        "n/a",
+        "na",
+        "none",
+    }
+    return label not in blocked
+
+
+def _store_shelf_keys(store_id=None, shelf_id=None):
+    return (str(store_id or "").strip(), str(shelf_id or "").strip())
+
+
 def _persist_run_snapshot(rows, occupancy_metrics, run_qwen=False, store_id=None, shelf_id=None):
+    run_ts = int(time.time())
     total_products = len(rows)
     known_products = sum(1 for row in rows if (row.get("product_category") or "unknown").lower() != "unknown")
     unknown_products = max(0, total_products - known_products)
@@ -361,7 +422,7 @@ def _persist_run_snapshot(rows, occupancy_metrics, run_qwen=False, store_id=None
     subcategory_mix = _build_mix(rows, "subcategory")
 
     with _db_connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO shelf_runs (
                 created_at, store_id, shelf_id, run_mode,
@@ -371,7 +432,7 @@ def _persist_run_snapshot(rows, occupancy_metrics, run_qwen=False, store_id=None
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(time.time()),
+                run_ts,
                 (store_id or "").strip() or None,
                 (shelf_id or "").strip() or None,
                 "full_sku" if run_qwen else "analyze",
@@ -385,6 +446,135 @@ def _persist_run_snapshot(rows, occupancy_metrics, run_qwen=False, store_id=None
                 avg_qwen_conf,
             ),
         )
+        run_id = int(cur.lastrowid or 0)
+
+        if run_qwen and run_id > 0:
+            sku_rows = []
+            inventory_rollup = {}
+            store_key, shelf_key = _store_shelf_keys(store_id, shelf_id)
+            for row in rows:
+                sku_detail = _clean_label(row.get("sku_detail"))
+                if not _is_persistable_sku_label(sku_detail):
+                    continue
+                qconf = row.get("qwen_confidence")
+                category = _clean_label(row.get("product_category") or "unknown") or "unknown"
+                subcategory = _clean_label(row.get("subcategory") or "unknown") or "unknown"
+                sku_rows.append(
+                    (
+                        run_id,
+                        run_ts,
+                        (store_id or "").strip() or None,
+                        (shelf_id or "").strip() or None,
+                        int(row.get("crop_id") or 0),
+                        sku_detail,
+                        category,
+                        subcategory,
+                        float(qconf) if isinstance(qconf, (int, float)) else None,
+                        1 if bool(row.get("semantic_mismatch_flag")) else 0,
+                    )
+                )
+
+                inv_key = (store_key, shelf_key, sku_detail, category, subcategory)
+                if inv_key not in inventory_rollup:
+                    inventory_rollup[inv_key] = {"qty": 0, "qconfs": []}
+                inventory_rollup[inv_key]["qty"] += 1
+                if isinstance(qconf, (int, float)):
+                    inventory_rollup[inv_key]["qconfs"].append(float(qconf))
+
+            if sku_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO sku_detections (
+                        run_id, created_at, store_id, shelf_id, crop_id,
+                        sku_detail, product_category, subcategory,
+                        qwen_confidence, semantic_mismatch_flag
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    sku_rows,
+                )
+
+                inventory_rows = []
+                for key, payload in inventory_rollup.items():
+                    sk_store, sk_shelf, sk_sku, sk_cat, sk_sub = key
+                    qvals = payload["qconfs"]
+                    avg_qconf = (sum(qvals) / len(qvals)) if qvals else None
+                    inventory_rows.append(
+                        (sk_store, sk_shelf, sk_sku, sk_cat, sk_sub, int(payload["qty"]), avg_qconf, run_ts)
+                    )
+
+                conn.executemany(
+                    """
+                    INSERT INTO sku_inventory (
+                        store_id, shelf_id, sku_detail, product_category, subcategory,
+                        quantity, avg_qwen_conf, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(store_id, shelf_id, sku_detail, product_category, subcategory)
+                    DO UPDATE SET
+                        quantity = sku_inventory.quantity + excluded.quantity,
+                        avg_qwen_conf = COALESCE(excluded.avg_qwen_conf, sku_inventory.avg_qwen_conf),
+                        last_updated = excluded.last_updated
+                    """,
+                    inventory_rows,
+                )
+
+
+def _get_inventory_quantity(sku_detail, category, subcategory, store_id=None, shelf_id=None):
+    sku = _clean_label(sku_detail)
+    category = _clean_label(category or "unknown") or "unknown"
+    subcategory = _clean_label(subcategory or "unknown") or "unknown"
+    if not _is_persistable_sku_label(sku):
+        return None
+
+    store_key, shelf_key = _store_shelf_keys(store_id, shelf_id)
+    with _db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT quantity
+            FROM sku_inventory
+            WHERE store_id = ? AND shelf_id = ? AND sku_detail = ? AND product_category = ? AND subcategory = ?
+            """,
+            (store_key, shelf_key, sku, category, subcategory),
+        ).fetchone()
+
+    if not row:
+        return None
+    return int(row[0] or 0)
+
+
+def _decrement_inventory_quantity(sku_detail, category, subcategory, quantity=1, store_id=None, shelf_id=None):
+    sku = _clean_label(sku_detail)
+    category = _clean_label(category or "unknown") or "unknown"
+    subcategory = _clean_label(subcategory or "unknown") or "unknown"
+    if not _is_persistable_sku_label(sku):
+        return None
+
+    qty = max(1, int(quantity or 1))
+    store_key, shelf_key = _store_shelf_keys(store_id, shelf_id)
+
+    with _db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT quantity
+            FROM sku_inventory
+            WHERE store_id = ? AND shelf_id = ? AND sku_detail = ? AND product_category = ? AND subcategory = ?
+            """,
+            (store_key, shelf_key, sku, category, subcategory),
+        ).fetchone()
+        if not row:
+            return None
+
+        current_qty = int(row[0] or 0)
+        new_qty = max(0, current_qty - qty)
+        conn.execute(
+            """
+            UPDATE sku_inventory
+            SET quantity = ?, last_updated = ?
+            WHERE store_id = ? AND shelf_id = ? AND sku_detail = ? AND product_category = ? AND subcategory = ?
+            """,
+            (new_qty, int(time.time()), store_key, shelf_key, sku, category, subcategory),
+        )
+
+    return {"before": current_qty, "after": new_qty, "decrement": qty}
 
 
 def _load_recent_runs(limit=10, store_id=None, shelf_id=None):
@@ -412,6 +602,41 @@ def _load_recent_runs(limit=10, store_id=None, shelf_id=None):
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
 
+    return [dict(r) for r in rows]
+
+
+def _load_low_stock_skus(threshold=2, limit=100, store_id=None, shelf_id=None):
+    threshold = max(1, int(threshold or 1))
+    limit = max(1, int(limit or 100))
+
+    where = []
+    params = []
+    if store_id and str(store_id).strip():
+        where.append("store_id = ?")
+        params.append(str(store_id).strip())
+    if shelf_id and str(shelf_id).strip():
+        where.append("shelf_id = ?")
+        params.append(str(shelf_id).strip())
+
+    sql = (
+        "SELECT sku_detail, product_category, subcategory, quantity, avg_qwen_conf, last_updated "
+        "FROM sku_inventory "
+    )
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
+    sql += (
+        "AND " if where else "WHERE "
+    )
+    sql += (
+        "quantity <= ? "
+        "ORDER BY quantity ASC, last_updated DESC "
+        "LIMIT ?"
+    )
+    params.extend([threshold, limit])
+
+    with _db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -856,11 +1081,13 @@ def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False, occupancy_
     unknown = max(0, total - known)
     occupancy = int(round((1.0 - float(empty_ratio)) * 100)) if total >= 0 else 0
     row_occupancy = []
+    occupancy_source = "Analyze detections"
     if occupancy_metrics:
         row_occupancy = occupancy_metrics.get("row_occupancy") or []
         coverage = occupancy_metrics.get("coverage_ratio")
         if isinstance(coverage, (int, float)):
             occupancy = int(round(float(coverage) * 100))
+        occupancy_source = occupancy_metrics.get("occupancy_source") or occupancy_source
 
     cat_counts = {}
     for row in rows:
@@ -882,6 +1109,13 @@ def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False, occupancy_
         ])
         rows_html = f"<div style='margin-top:8px;'><div class='kpi-label'>Row Occupancy</div>{chips}</div>"
 
+    source_badge_html = (
+        "<div style='margin-top:10px;'>"
+        "<span style='display:inline-block;padding:5px 10px;border-radius:999px;"
+        "background:#ecfdf5;border:1px solid #99f6e4;color:#115e59;font-size:0.82rem;'>"
+        f"Occupancy source: {occupancy_source}</span></div>"
+    )
+
     return (
         "<div class='kpi-grid'>"
         f"<div class='kpi-card'><div class='kpi-label'>Shelf Occupancy</div><div class='kpi-value'>{occupancy}%</div></div>"
@@ -889,7 +1123,7 @@ def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False, occupancy_
         f"<div class='kpi-card'><div class='kpi-label'>Top Category</div><div class='kpi-value'>{top_category}</div></div>"
         f"<div class='kpi-card'><div class='kpi-label'>Avg Qwen Confidence</div><div class='kpi-value'>{avg_qwen}</div></div>"
         "</div>"
-        f"{rows_html}"
+        f"{source_badge_html}{rows_html}"
     )
 
 
@@ -1079,6 +1313,49 @@ def run_bi_query(selected_query, rows_state, store_id=None, shelf_id=None):
             f"<tbody>{''.join(mismatch_rows)}</tbody></table></div>"
         )
 
+    if selected_query == "Which SKUs are low stock? (SQLite, Qwen only)":
+        low_stock_rows = _load_low_stock_skus(
+            threshold=LOW_STOCK_FACING_THRESHOLD,
+            limit=100,
+            store_id=store_id,
+            shelf_id=shelf_id,
+        )
+
+        if not low_stock_rows:
+            return (
+                "<h4>Low stock SKUs</h4>"
+                f"<p>No SKUs are currently at or below the threshold of {LOW_STOCK_FACING_THRESHOLD} facings for this filter.</p>"
+            )
+
+        row_html = []
+        for rec in low_stock_rows:
+            sku = rec.get("sku_detail") or "unknown"
+            cat = rec.get("product_category") or "unknown"
+            sub = rec.get("subcategory") or "unknown"
+            facing_count = int(rec.get("quantity") or 0)
+            avg_conf = rec.get("avg_qwen_conf")
+            avg_conf_text = f"{float(avg_conf)*100:.0f}%" if isinstance(avg_conf, (int, float)) else "N/A"
+            last_seen = int(rec.get("last_updated") or 0)
+            last_seen_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen)) if last_seen else "N/A"
+            row_html.append(
+                "<tr>"
+                f"<td>{sku}</td>"
+                f"<td>{cat}</td>"
+                f"<td>{sub}</td>"
+                f"<td>{facing_count}</td>"
+                f"<td>{avg_conf_text}</td>"
+                f"<td>{last_seen_text}</td>"
+                "</tr>"
+            )
+
+        return (
+            "<h4>Low stock SKUs</h4>"
+            f"<p><b>Threshold:</b> {LOW_STOCK_FACING_THRESHOLD} units or fewer.</p>"
+            "<div class='sku-table-wrap'><table class='sku-table'>"
+            "<thead><tr><th>SKU / Product</th><th>Category</th><th>Subcategory</th><th>Current Quantity</th><th>Avg Qwen Confidence</th><th>Last Updated</th></tr></thead>"
+            f"<tbody>{''.join(row_html)}</tbody></table></div>"
+        )
+
     if selected_query == "Show recent run history (SQLite).":
         recent = _load_recent_runs(limit=10, store_id=store_id, shelf_id=shelf_id)
         if not recent:
@@ -1174,17 +1451,19 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
     print(f"[timing] YOLO inference took {t_yolo - t0:.3f}s")
     raw_boxes = results[0].boxes.xyxy.cpu().numpy()
     boxes, filtered_count, skipped_count = _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=run_qwen)
+    occupancy_boxes, _, _ = _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=False)
 
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
 
     rows = []
     occupancy_metrics = estimate_shelf_occupancy(
-        boxes,
+        occupancy_boxes,
         img_w,
         img_h,
         row_count=OCCUPANCY_ROW_COUNT,
     )
+    occupancy_metrics["occupancy_source"] = "Analyze detections"
     empty_ratio = float(occupancy_metrics.get("empty_ratio", 1.0))
     empty_label = occupancy_metrics.get("empty_label") or _empty_label_from_ratio(empty_ratio)
 
@@ -1195,6 +1474,8 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
         draw.text((sx1, max(0, sy1 - 12)), "shelf region", fill="#2563eb")
 
     initial_status = f"Detected {len(raw_boxes)} raw crop{'s' if len(raw_boxes) != 1 else ''}. Processing {len(boxes)} crop{'s' if len(boxes) != 1 else ''}."
+    if run_qwen:
+        initial_status += f" Occupancy uses Analyze-mode boxes ({len(occupancy_boxes)} crops) for stable shelf metrics."
     if skipped_count > 0:
         initial_status += f" Skipped {skipped_count} low-priority crop{'s' if skipped_count != 1 else ''} for faster response."
     if resized_for_speed:
@@ -1430,7 +1711,7 @@ def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
     return f"<p>No detected box with id {crop_id} was found.</p>", None
 
 
-def get_selected_crop_details(selected_crop_id, rows_state):
+def get_selected_crop_details(selected_crop_id, rows_state, store_id=None, shelf_id=None):
     if not rows_state:
         return None, "<p>No detected crops yet. Run analysis first.</p>"
 
@@ -1463,6 +1744,8 @@ def get_selected_crop_details(selected_crop_id, rows_state):
         semantic_match_label = "Matched"
         if bool(row.get("semantic_mismatch_flag")):
             semantic_match_label = "Mismatch"
+        inventory_qty = _get_inventory_quantity(sku_detail, category, subcategory, store_id=store_id, shelf_id=shelf_id)
+        inventory_qty_text = str(inventory_qty) if isinstance(inventory_qty, int) else "Not tracked yet"
 
         details_html = (
             f"<h4>Crop {crop_id} mapping details</h4>"
@@ -1476,6 +1759,7 @@ def get_selected_crop_details(selected_crop_id, rows_state):
             f"<tr><td>Qwen Subcategory</td><td>{subcategory}</td></tr>"
             f"<tr><td>Semantic Comparison</td><td>{semantic_match_label}</td></tr>"
             f"<tr><td>Qwen SKU / Product</td><td>{sku_detail}</td></tr>"
+            f"<tr><td>Current DB Quantity</td><td>{inventory_qty_text}</td></tr>"
             f"<tr><td>Qwen Confidence</td><td>{confidence_text}</td></tr>"
             f"<tr><td>Resolver Confidence</td><td>{mapped_confidence_text}</td></tr>"
             "</tbody></table>"
@@ -1486,6 +1770,55 @@ def get_selected_crop_details(selected_crop_id, rows_state):
         return crop_image, details_html
 
     return None, f"<p>No detected box with id {crop_id} was found.</p>"
+
+
+def checkout_selected_crop(selected_crop_id, rows_state, checkout_quantity, store_id, shelf_id):
+    if not rows_state:
+        return "<p>No detected boxes are available yet.</p>"
+
+    try:
+        crop_id = int(selected_crop_id)
+    except (TypeError, ValueError):
+        return "<p>Please select a detected crop first.</p>"
+
+    qty = max(1, int(checkout_quantity or 1))
+
+    for row in rows_state:
+        if int(row.get("crop_id", -1)) != crop_id:
+            continue
+
+        sku_detail = row.get("sku_detail") or ""
+        category = row.get("product_category") or "unknown"
+        subcategory = row.get("subcategory") or "unknown"
+
+        if not _is_persistable_sku_label(sku_detail):
+            return "<p>This crop does not have a valid Qwen SKU to checkout yet. Run Full SKU mode first.</p>"
+
+        result = _decrement_inventory_quantity(
+            sku_detail=sku_detail,
+            category=category,
+            subcategory=subcategory,
+            quantity=qty,
+            store_id=store_id,
+            shelf_id=shelf_id,
+        )
+        if result is None:
+            return (
+                "<p>No inventory record found for this SKU in the selected store/shelf filter. "
+                "Run Full SKU detection first to populate inventory.</p>"
+            )
+
+        warn = ""
+        if int(result["after"]) <= LOW_STOCK_FACING_THRESHOLD:
+            warn = f" <b>Low stock alert:</b> quantity is now {int(result['after'])}."
+
+        return (
+            f"<p>Checkout successful for crop <b>{crop_id}</b>. "
+            f"SKU <b>{_clean_label(sku_detail)}</b> decremented by <b>{int(result['decrement'])}</b>. "
+            f"Quantity: <b>{int(result['before'])}</b> -> <b>{int(result['after'])}</b>.{warn}</p>"
+        )
+
+    return f"<p>No detected box with id {crop_id} was found.</p>"
 
 
 with gr.Blocks(
@@ -1546,8 +1879,12 @@ with gr.Blocks(
             with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-4"]):
                 flag_reason = gr.Textbox(label="Flag reason if SKU is unclear", placeholder="e.g. blurry, occluded, no visible barcode")
                 save_button = gr.Button("Flag and save selected crop")
+            with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-4"]):
+                checkout_quantity = gr.Number(value=1, precision=0, minimum=1, label="Checkout quantity")
+                checkout_button = gr.Button("Checkout selected crop", variant="secondary")
             with gr.Row(elem_classes=["panel", "animate-in", "stagger-4"]):
                 flagged_output = gr.HTML(label="Flag / save status")
+                checkout_output = gr.HTML(label="Checkout status")
                 download_flagged_crop = gr.File(label="Download saved flagged crop")
 
         with gr.Tab("Analytics & BI"):
@@ -1564,6 +1901,7 @@ with gr.Blocks(
                         "Which row is most under-stocked?",
                         "Which row should be replenished first?",
                         "Show Analyze vs Qwen mismatches (semantic).",
+                        "Which SKUs are low stock? (SQLite, Qwen only)",
                         "Show recent run history (SQLite).",
                         "How has occupancy changed recently?",
                     ],
@@ -1590,8 +1928,13 @@ with gr.Blocks(
     )
     crop_selector.change(
         get_selected_crop_details,
-        inputs=[crop_selector, rows_state],
+        inputs=[crop_selector, rows_state, store_id_input, shelf_id_input],
         outputs=[selected_crop_image, selected_crop_mapping],
+    )
+    checkout_button.click(
+        checkout_selected_crop,
+        inputs=[crop_selector, rows_state, checkout_quantity, store_id_input, shelf_id_input],
+        outputs=[checkout_output],
     )
     bi_button.click(
         run_bi_query,
