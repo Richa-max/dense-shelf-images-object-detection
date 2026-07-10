@@ -931,12 +931,14 @@ def _build_sku_table_html(rows, run_qwen=False):
 
     lines = [
         "<div class='sku-table-wrap'><table class='sku-table'>",
-        "<thead><tr><th>Crop</th><th>SKU / Product</th><th>Analyze Category</th><th>Analyze Subcategory</th><th>Qwen Category</th><th>Qwen Subcategory</th><th>Semantic Match</th><th>Clues</th><th>Confidence</th></tr></thead>",
+        "<thead><tr><th>Crop</th><th>SKU</th><th>Product</th><th>Brand</th><th>Analyze Category</th><th>Analyze Subcategory</th><th>Qwen Category</th><th>Qwen Subcategory</th><th>Semantic Match</th><th>Clues</th><th>Confidence</th></tr></thead>",
         "<tbody>",
     ]
     for row in rows:
         crop_id = row.get("crop_id")
-        sku_detail = row.get("sku_detail") or "No SKU detected"
+        sku_code = row.get("qwen_sku") or "-"
+        product_name = row.get("qwen_product_name") or "-"
+        brand_name = row.get("qwen_brand") or "-"
         category = row.get("product_category") or "unknown"
         subcategory = row.get("subcategory") or "unknown"
         analyze_category = row.get("analyze_category") or "unknown"
@@ -953,7 +955,7 @@ def _build_sku_table_html(rows, run_qwen=False):
             confidence_text = f"{confidence*100:.0f}% ({confidence_label})"
 
         lines.append(
-            f"<tr><td>{crop_id}</td><td>{sku_detail}</td><td>{analyze_category}</td><td>{analyze_subcategory}</td><td>{category}</td><td>{subcategory}</td><td>{match_label}</td><td>{clues_text}</td><td>{confidence_text}</td></tr>"
+            f"<tr><td>{crop_id}</td><td>{sku_code}</td><td>{product_name}</td><td>{brand_name}</td><td>{analyze_category}</td><td>{analyze_subcategory}</td><td>{category}</td><td>{subcategory}</td><td>{match_label}</td><td>{clues_text}</td><td>{confidence_text}</td></tr>"
         )
 
     lines.extend(["</tbody>", "</table></div>"])
@@ -1007,6 +1009,8 @@ def _build_detected_items_html(rows, run_qwen=False):
 
 
 def _build_answer_html(question, rows, empty_ratio, empty_label):
+    if not question:
+        question = "How many products were detected on this shelf?"
     unique_cats = {}
     unknown_items = []
     for r in rows:
@@ -1425,7 +1429,6 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
     progress_html = _build_progress_html(processed_count=processed_count, total_count=total_count, run_qwen=run_qwen, status_text=status_text)
     box_choices = [str(r["crop_id"]) for r in rows]
     initial_choice = box_choices[0] if box_choices else None
-    sku_results_html = _build_sku_results_html(rows, run_qwen=run_qwen)
     kpi_html = _build_kpi_html(rows, run_qwen=run_qwen)
     sku_table_html = _build_sku_table_html(rows, run_qwen=run_qwen)
     analytics_html = _build_analytics_overview_html(rows, empty_ratio, run_qwen=run_qwen, occupancy_metrics=occupancy_metrics)
@@ -1437,7 +1440,6 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
         progress_html,
         gr.update(choices=box_choices, value=initial_choice),
         rows,
-        sku_results_html,
         kpi_html,
         sku_table_html,
         analytics_html,
@@ -1569,6 +1571,9 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
         qwen_clues = []
         qwen_category = None
         qwen_subcategory = None
+        qwen_sku = None
+        qwen_product_name = None
+        qwen_brand = None
         analyze_category = final_category
         analyze_subcategory = subcategory_label
         semantic_match_category = None
@@ -1585,6 +1590,9 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
             qwen_confidence_label = sku_result.get("confidence_label")
             structured = sku_result.get("structured") or {}
             qwen_clues = structured.get("clues") or []
+            qwen_sku = _clean_label(structured.get("sku") or "")
+            qwen_product_name = _clean_label(structured.get("product_name") or "")
+            qwen_brand = _clean_label(structured.get("brand") or "")
             qwen_category = _clean_label(structured.get("category") or "")
             qwen_subcategory = _clean_label(structured.get("subcategory") or "")
 
@@ -1614,6 +1622,9 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
                 "qwen_confidence": qwen_confidence,
                 "qwen_confidence_label": qwen_confidence_label,
                 "qwen_clues": qwen_clues,
+                "qwen_sku": qwen_sku,
+                "qwen_product_name": qwen_product_name,
+                "qwen_brand": qwen_brand,
                 "analyze_category": analyze_category,
                 "analyze_subcategory": analyze_subcategory,
                 "qwen_category": qwen_category,
@@ -1663,7 +1674,8 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
     )
 
 
-def analyze_shelf(input_image, question, store_id, shelf_id):
+def analyze_shelf(input_image, store_id, shelf_id):
+    question = "How many products were detected on this shelf?"
     yield from process_image_stream(
         input_image,
         question,
@@ -1673,7 +1685,8 @@ def analyze_shelf(input_image, question, store_id, shelf_id):
     )
 
 
-def run_full_shelf_sku(input_image, question, store_id, shelf_id):
+def run_full_shelf_sku(input_image, store_id, shelf_id):
+    question = "How many products were detected on this shelf?"
     yield from process_image_stream(
         input_image,
         question,
@@ -1844,17 +1857,6 @@ with gr.Blocks(
             gr.Markdown("<div class='tab-banner'><b>Detection workspace:</b> upload shelf images, run quick analysis, or run full SKU extraction.</div>")
             with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-1"]):
                 image_input = gr.Image(type="pil", label="Upload shelf image")
-                question_input = gr.Dropdown(
-                    choices=[
-                        "How many products were detected on this shelf?",
-                        "Which are the top detected categories by count?",
-                        "Which items need manual review?",
-                        "Is this shelf mixed or category-specific?",
-                        "How much empty space is visible on this shelf?",
-                    ],
-                    value="How many products were detected on this shelf?",
-                    label="Select a Store Management question",
-                )
             with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-1"]):
                 store_id_input = gr.Textbox(label="Store ID", placeholder="e.g. store_001")
                 shelf_id_input = gr.Textbox(label="Shelf ID", placeholder="e.g. snacks_aisle_left")
@@ -1871,7 +1873,6 @@ with gr.Blocks(
                 output_image = gr.Image(type="pil", label="Annotated image")
                 output_summary = gr.HTML(label="Summary")
                 output_answer = gr.HTML(label="Selected question answer")
-            output_sku_results = gr.HTML(label="Full shelf SKU results", elem_id="sku-results", elem_classes=["panel", "animate-in", "stagger-3"])
             output_sku_table = gr.HTML(label="SKU Results Table", elem_classes=["panel", "animate-in", "stagger-4"])
 
         with gr.Tab("Crop Review & Flag"):
@@ -1917,13 +1918,13 @@ with gr.Blocks(
 
     analyze_button.click(
         analyze_shelf,
-        inputs=[image_input, question_input, store_id_input, shelf_id_input],
-        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
+        inputs=[image_input, store_id_input, shelf_id_input],
+        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, kpi_cards, output_sku_table, analytics_overview],
     )
     sku_button.click(
         run_full_shelf_sku,
-        inputs=[image_input, question_input, store_id_input, shelf_id_input],
-        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
+        inputs=[image_input, store_id_input, shelf_id_input],
+        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, kpi_cards, output_sku_table, analytics_overview],
     )
     save_button.click(
         save_flagged_crop,
