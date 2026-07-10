@@ -838,11 +838,11 @@ def process_image_stream(input_image, question, run_qwen=False):
 
 
 def analyze_shelf(input_image, question):
-    return process_image_stream(input_image, question, run_qwen=False)
+    yield from process_image_stream(input_image, question, run_qwen=False)
 
 
 def run_full_shelf_sku(input_image, question):
-    return process_image_stream(input_image, question, run_qwen=True)
+    yield from process_image_stream(input_image, question, run_qwen=True)
 
 
 def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
@@ -929,8 +929,6 @@ def get_selected_crop_details(selected_crop_id, rows_state):
 
 with gr.Blocks(
     title="Smart Shelf Management Dashboard",
-    theme=gr.themes.Base(primary_hue="teal", secondary_hue="cyan", neutral_hue="slate"),
-    css=CUSTOM_CSS,
 ) as demo:
     gr.Markdown(
         """
@@ -1036,6 +1034,8 @@ if __name__ == "__main__":
     demo.launch(
         server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(os.getenv("PORT", "7860")),
+        theme=gr.themes.Base(primary_hue="teal", secondary_hue="cyan", neutral_hue="slate"),
+        css=CUSTOM_CSS,
         show_error=True,
         inbrowser=False,
     )
