@@ -24,7 +24,7 @@ if os.path.exists(_SC_PATH):
             _SUBCATS = json.load(fh)
     except Exception:
         _SUBCATS = {}
-from llava4_model import generate_llava4_answer
+from qwen_model import generate_qwen_sku_answer
 from retail_product_resolver import resolve_retail_product, summarize_retail_decisions
 
 
@@ -239,7 +239,7 @@ def process_image(input_image, question):
             "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
             "Return a concise answer only."
         )
-        sku_result = generate_llava4_answer(
+        sku_result = generate_qwen_sku_answer(
             image=crop,
             broad_category=final_category,
             user_prompt=sku_prompt,
@@ -257,7 +257,7 @@ def process_image(input_image, question):
                 "subcategory": subcategory_label,
                 "swin": swin_result,
                 "clip": None,
-                "llava_subcategory": {"answer": None, "status": "disabled"},
+                "qwen_sku": None,
                 "retail_product": retail_product,
                 "crop_image": crop,
                 "sku_detail": sku_detail,
@@ -351,37 +351,6 @@ def process_image(input_image, question):
     return annotated, summary_html, answer_html, gr.update(choices=box_choices, value=initial_choice), rows, sku_results_html
 
 
-def inspect_selected_crop(selected_crop_id, rows_state):
-    if not rows_state:
-        return None, "<p>No detected boxes are available yet.</p>"
-    try:
-        crop_id = int(selected_crop_id)
-    except (TypeError, ValueError):
-        return None, "<p>Please select a detected box first.</p>"
-
-    for row in rows_state:
-        if int(row.get("crop_id", -1)) != crop_id:
-            continue
-        crop_image = row.get("crop_image")
-        if crop_image is None:
-            return None, f"<p>Crop {crop_id} was detected but no image crop is available.</p>"
-        prompt = (
-            "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
-            "Return a short answer only."
-        )
-        result = generate_llava4_answer(
-            image=crop_image,
-            broad_category=row.get("product_category") or "unknown",
-            user_prompt=prompt,
-        )
-        answer = (result.get("answer") or "").strip()
-        if not answer:
-            answer = result.get("error") or "No product detail was detected."
-        return crop_image, f"<p><b>Selected box {crop_id}</b><br>{answer}</p>"
-
-    return None, f"<p>No detected box with id {crop_id} was found.</p>"
-
-
 def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
     if not rows_state:
         return "<p>No detected boxes are available yet.</p>", None
@@ -437,12 +406,6 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
         output_answer = gr.HTML(label="Selected question answer")
     output_sku_results = gr.HTML(label="Full shelf SKU results")
     with gr.Row():
-        crop_selector = gr.Dropdown(choices=[], label="Select a detected box to inspect")
-        inspect_button = gr.Button("Inspect selected box with LLaVA")
-    with gr.Row():
-        crop_preview = gr.Image(type="pil", label="Selected crop preview")
-        output_sku = gr.HTML(label="Category / subcategory / SKU detail")
-    with gr.Row():
         flag_reason = gr.Textbox(label="Flag reason if SKU is unclear", placeholder="e.g. blurry, occluded, no visible barcode")
         save_button = gr.Button("Flag and save selected crop")
     with gr.Row():
@@ -459,11 +422,6 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
         process_image,
         inputs=[image_input, question_input],
         outputs=[output_image, output_summary, output_answer, crop_selector, rows_state, output_sku_results],
-    )
-    inspect_button.click(
-        inspect_selected_crop,
-        inputs=[crop_selector, rows_state],
-        outputs=[crop_preview, output_sku],
     )
     save_button.click(
         save_flagged_crop,

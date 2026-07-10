@@ -20,9 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LLAMA_LOAD_IN_4BIT=1 \
     OLLAMA_AUTOSTART=1 \
     OLLAMA_MODELS=/workspace/.ollama/models \
-    LLAVA_PROVIDER=ollama \
+    QWEN_PROVIDER=ollama \
     OLLAMA_BASE_URL=http://127.0.0.1:11434 \
-    OLLAMA_MODEL=llava:13b \
+    OLLAMA_MODEL=qwen2.5vl:3b \
     PORT=7860
 
 WORKDIR /workspace/app

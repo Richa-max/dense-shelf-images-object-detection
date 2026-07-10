@@ -74,7 +74,7 @@ def _classify_crop_image(img: Image.Image) -> dict:
         "category": result_label,
         "swin": swin_result,
         "clip": None,
-        "llava4": None,
+        "qwen_sku": None,
         "retail_product": retail_product,
     }
 
@@ -111,7 +111,7 @@ def classify_crop():
             "category": classification["category"],
             "swin": classification["swin"],
             "clip": None,
-            "llava4": None,
+            "qwen_sku": None,
             "retail_product": classification["retail_product"],
         }
     )
@@ -147,7 +147,7 @@ def classify_shelf():
                     "category": classification["category"],
                     "swin": classification["swin"],
                     "clip": None,
-                    "llava4": None,
+                    "qwen_sku": None,
                     "retail_product": classification["retail_product"],
                 }
             )
