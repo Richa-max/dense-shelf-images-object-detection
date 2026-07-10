@@ -311,6 +311,7 @@ MIN_BOX_AREA_RATIO = float(os.getenv("APP_MIN_BOX_AREA_RATIO", "0.00015"))
 OCCUPANCY_ROW_COUNT = int(os.getenv("APP_OCCUPANCY_ROW_COUNT", "4"))
 ANALYTICS_DB_PATH = os.getenv("APP_ANALYTICS_DB_PATH", "shelf_analytics.db")
 LOW_STOCK_FACING_THRESHOLD = int(os.getenv("APP_LOW_STOCK_FACING_THRESHOLD", "2"))
+DEFAULT_PAGE_SIZE = int(os.getenv("APP_DEFAULT_PAGE_SIZE", "10"))
 
 
 def _db_connect():
@@ -1057,6 +1058,66 @@ def _build_sku_results_html(rows, run_qwen=False):
     return sku_results_html
 
 
+def _normalize_page_size(page_size):
+    try:
+        parsed = int(page_size)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_PAGE_SIZE
+    return max(1, min(parsed, 200))
+
+
+def _paginate_rows(rows, page=1, page_size=10):
+    safe_rows = rows or []
+    size = _normalize_page_size(page_size)
+    total = len(safe_rows)
+    total_pages = max(1, int(np.ceil(total / float(size))))
+    current_page = max(1, min(int(page or 1), total_pages))
+    start = (current_page - 1) * size
+    end = start + size
+    return safe_rows[start:end], current_page, total_pages, total
+
+
+def _build_pagination_status_html(total, page, total_pages, page_size):
+    return (
+        "<div style='font-size:0.9rem;color:#334155;'>"
+        f"Showing page <b>{page}</b> of <b>{total_pages}</b> "
+        f"(rows per page: {page_size}, total rows: {total})"
+        "</div>"
+    )
+
+
+def _render_paginated_outputs(rows, run_qwen=False, page=1, page_size=10):
+    page_rows, current_page, total_pages, total_rows = _paginate_rows(rows, page=page, page_size=page_size)
+    size = _normalize_page_size(page_size)
+    detected_items_html = _build_detected_items_html(page_rows, run_qwen=run_qwen)
+    sku_table_html = _build_sku_table_html(page_rows, run_qwen=run_qwen)
+    sku_results_html = _build_sku_results_html(page_rows, run_qwen=run_qwen)
+    page_status_html = _build_pagination_status_html(total_rows, current_page, total_pages, size)
+    return detected_items_html, sku_table_html, sku_results_html, page_status_html, current_page
+
+
+def _update_paginated_view(rows_state, run_qwen_state, current_page, page_size):
+    detected_html, sku_table_html, sku_results_html, status_html, normalized_page = _render_paginated_outputs(
+        rows_state,
+        run_qwen=bool(run_qwen_state),
+        page=current_page,
+        page_size=page_size,
+    )
+    return detected_html, sku_table_html, sku_results_html, status_html, normalized_page
+
+
+def _go_prev_page(rows_state, run_qwen_state, current_page, page_size):
+    return _update_paginated_view(rows_state, run_qwen_state, max(1, int(current_page or 1) - 1), page_size)
+
+
+def _go_next_page(rows_state, run_qwen_state, current_page, page_size):
+    return _update_paginated_view(rows_state, run_qwen_state, int(current_page or 1) + 1, page_size)
+
+
+def _reset_to_first_page(rows_state, run_qwen_state, page_size):
+    return _update_paginated_view(rows_state, run_qwen_state, 1, page_size)
+
+
 def _build_progress_html(processed_count, total_count, run_qwen=False, status_text=None):
     total_count = max(0, int(total_count or 0))
     processed_count = max(0, min(int(processed_count or 0), total_count if total_count > 0 else 0))
@@ -1411,9 +1472,8 @@ def run_bi_query(selected_query, rows_state, store_id=None, shelf_id=None):
     return "<p>Select a BI query and click Run BI Query.</p>"
 
 
-def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label, run_qwen=False, status_text=None, processed_count=0, total_count=0, occupancy_metrics=None):
+def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label, run_qwen=False, status_text=None, processed_count=0, total_count=0, occupancy_metrics=None, page_size=10):
     summary_html = _build_summary_html(rows, empty_ratio, empty_label, occupancy_metrics=occupancy_metrics)
-    summary_html = f"{summary_html}\n{_build_detected_items_html(rows, run_qwen=run_qwen)}"
     answer_html = _build_answer_html(question, rows, empty_ratio, empty_label)
     if status_text:
         answer_html = f"<p><i>{status_text}</i></p>{answer_html}"
@@ -1421,14 +1481,19 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
     progress_html = _build_progress_html(processed_count=processed_count, total_count=total_count, run_qwen=run_qwen, status_text=status_text)
     box_choices = [str(r["crop_id"]) for r in rows]
     initial_choice = box_choices[0] if box_choices else None
-    sku_results_html = _build_sku_results_html(rows, run_qwen=run_qwen)
+    detected_items_html, sku_table_html, sku_results_html, page_status_html, _ = _render_paginated_outputs(
+        rows,
+        run_qwen=run_qwen,
+        page=1,
+        page_size=page_size,
+    )
     kpi_html = _build_kpi_html(rows, run_qwen=run_qwen)
-    sku_table_html = _build_sku_table_html(rows, run_qwen=run_qwen)
     analytics_html = _build_analytics_overview_html(rows, empty_ratio, run_qwen=run_qwen, occupancy_metrics=occupancy_metrics)
 
     return (
         annotated,
         summary_html,
+        detected_items_html,
         answer_html,
         progress_html,
         gr.update(choices=box_choices, value=initial_choice),
@@ -1437,10 +1502,13 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
         kpi_html,
         sku_table_html,
         analytics_html,
+        page_status_html,
+        1,
+        bool(run_qwen),
     )
 
 
-def process_image_stream(input_image, question, run_qwen=False, store_id=None, shelf_id=None):
+def process_image_stream(input_image, question, run_qwen=False, store_id=None, shelf_id=None, page_size=10):
     t0 = time.time()
     image = input_image.convert("RGB")
     image, resized_for_speed = _resize_for_inference(image, MAX_INPUT_EDGE)
@@ -1492,6 +1560,7 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
         processed_count=0,
         total_count=len(boxes),
         occupancy_metrics=occupancy_metrics,
+        page_size=page_size,
     )
 
     def _looks_like_path_label(label: str) -> bool:
@@ -1632,6 +1701,7 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
             processed_count=i + 1,
             total_count=len(boxes),
             occupancy_metrics=occupancy_metrics,
+            page_size=page_size,
         )
 
     final_status = f"Completed processing {len(rows)} crop{'s' if len(rows) != 1 else ''}."
@@ -1656,26 +1726,29 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
         processed_count=len(rows),
         total_count=len(boxes),
         occupancy_metrics=occupancy_metrics,
+        page_size=page_size,
     )
 
 
-def analyze_shelf(input_image, question, store_id, shelf_id):
+def analyze_shelf(input_image, question, store_id, shelf_id, page_size):
     yield from process_image_stream(
         input_image,
         question,
         run_qwen=False,
         store_id=store_id,
         shelf_id=shelf_id,
+        page_size=page_size,
     )
 
 
-def run_full_shelf_sku(input_image, question, store_id, shelf_id):
+def run_full_shelf_sku(input_image, question, store_id, shelf_id, page_size):
     yield from process_image_stream(
         input_image,
         question,
         run_qwen=True,
         store_id=store_id,
         shelf_id=shelf_id,
+        page_size=page_size,
     )
 
 
@@ -1834,6 +1907,8 @@ with gr.Blocks(
     )
 
     rows_state = gr.State(value=[])
+    pagination_page_state = gr.State(value=1)
+    run_mode_state = gr.State(value=False)
 
     with gr.Tabs():
         with gr.Tab("Detection Studio"):
@@ -1857,6 +1932,11 @@ with gr.Blocks(
             with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-2"]):
                 analyze_button = gr.Button("Analyze shelf", variant="secondary")
                 sku_button = gr.Button("Run full shelf SKU detection", variant="primary")
+                page_size_input = gr.Dropdown(
+                    choices=["5", "10", "20", "50"],
+                    value=str(DEFAULT_PAGE_SIZE if DEFAULT_PAGE_SIZE in {5, 10, 20, 50} else 10),
+                    label="Rows per page",
+                )
 
             gr.Markdown("<div class='section-title'>Live processing insights</div>")
             kpi_cards = gr.HTML(label="KPI Overview", elem_classes=["panel", "animate-in", "stagger-2"])
@@ -1867,6 +1947,11 @@ with gr.Blocks(
                 output_image = gr.Image(type="pil", label="Annotated image")
                 output_summary = gr.HTML(label="Summary")
                 output_answer = gr.HTML(label="Selected question answer")
+            output_detected_items = gr.HTML(label="Detected Items", elem_classes=["panel", "animate-in", "stagger-3"])
+            with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-3"]):
+                prev_page_button = gr.Button("Previous page")
+                next_page_button = gr.Button("Next page")
+                pagination_status = gr.HTML(label="Pagination", value="<div style='font-size:0.9rem;color:#334155;'>Showing page <b>1</b> of <b>1</b> (rows per page: 10, total rows: 0)</div>")
             output_sku_results = gr.HTML(label="Full shelf SKU results", elem_id="sku-results", elem_classes=["panel", "animate-in", "stagger-3"])
             output_sku_table = gr.HTML(label="SKU Results Table", elem_classes=["panel", "animate-in", "stagger-4"])
 
@@ -1913,13 +1998,13 @@ with gr.Blocks(
 
     analyze_button.click(
         analyze_shelf,
-        inputs=[image_input, question_input, store_id_input, shelf_id_input],
-        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
+        inputs=[image_input, question_input, store_id_input, shelf_id_input, page_size_input],
+        outputs=[output_image, output_summary, output_detected_items, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview, pagination_status, pagination_page_state, run_mode_state],
     )
     sku_button.click(
         run_full_shelf_sku,
-        inputs=[image_input, question_input, store_id_input, shelf_id_input],
-        outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
+        inputs=[image_input, question_input, store_id_input, shelf_id_input, page_size_input],
+        outputs=[output_image, output_summary, output_detected_items, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview, pagination_status, pagination_page_state, run_mode_state],
     )
     save_button.click(
         save_flagged_crop,
@@ -1935,6 +2020,21 @@ with gr.Blocks(
         checkout_selected_crop,
         inputs=[crop_selector, rows_state, checkout_quantity, store_id_input, shelf_id_input],
         outputs=[checkout_output],
+    )
+    prev_page_button.click(
+        _go_prev_page,
+        inputs=[rows_state, run_mode_state, pagination_page_state, page_size_input],
+        outputs=[output_detected_items, output_sku_table, output_sku_results, pagination_status, pagination_page_state],
+    )
+    next_page_button.click(
+        _go_next_page,
+        inputs=[rows_state, run_mode_state, pagination_page_state, page_size_input],
+        outputs=[output_detected_items, output_sku_table, output_sku_results, pagination_status, pagination_page_state],
+    )
+    page_size_input.change(
+        _reset_to_first_page,
+        inputs=[rows_state, run_mode_state, page_size_input],
+        outputs=[output_detected_items, output_sku_table, output_sku_results, pagination_status, pagination_page_state],
     )
     bi_button.click(
         run_bi_query,
