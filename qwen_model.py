@@ -18,6 +18,8 @@ QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 QWEN_MAX_NEW_TOKENS = int(os.getenv("QWEN_MAX_NEW_TOKENS", "96"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", os.getenv("QWEN_OLLAMA_MODEL", "qwen2.5vl:3b"))
+QWEN_OLLAMA_TIMEOUT = int(os.getenv("QWEN_OLLAMA_TIMEOUT", "60"))
+QWEN_OLLAMA_TRY_CHAT = os.getenv("QWEN_OLLAMA_TRY_CHAT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _confidence_label(score: float) -> str:
@@ -98,25 +100,29 @@ def _translate_to_english_ollama(text: str) -> str:
         f"{text}"
     )
     base_url = OLLAMA_BASE_URL.rstrip("/")
-    endpoints = [f"{base_url}/api/generate", f"{base_url}/api/chat"]
+    endpoints = [f"{base_url}/api/generate"]
     payloads = [
         {
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
             "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
-        },
-        {
-            "model": OLLAMA_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
-        },
+        }
     ]
+    if QWEN_OLLAMA_TRY_CHAT:
+        endpoints.append(f"{base_url}/api/chat")
+        payloads.append(
+            {
+                "model": OLLAMA_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
+            }
+        )
 
     for endpoint, payload in zip(endpoints, payloads):
         try:
-            response = requests.post(endpoint, json=payload, timeout=120)
+            response = requests.post(endpoint, json=payload, timeout=QWEN_OLLAMA_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             if endpoint.endswith("/api/generate"):
@@ -244,7 +250,7 @@ def generate_qwen_sku_answer(
             image_b64 = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
 
             base_url = OLLAMA_BASE_URL.rstrip("/")
-            endpoints = [f"{base_url}/api/generate", f"{base_url}/api/chat"]
+            endpoints = [f"{base_url}/api/generate"]
             payloads = [
                 {
                     "model": OLLAMA_MODEL,
@@ -252,19 +258,23 @@ def generate_qwen_sku_answer(
                     "images": [image_b64],
                     "stream": False,
                     "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
-                },
-                {
-                    "model": OLLAMA_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
-                },
+                }
             ]
+            if QWEN_OLLAMA_TRY_CHAT:
+                endpoints.append(f"{base_url}/api/chat")
+                payloads.append(
+                    {
+                        "model": OLLAMA_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
+                    }
+                )
 
             last_error = None
             for endpoint, payload in zip(endpoints, payloads):
                 try:
-                    response = requests.post(endpoint, json=payload, timeout=180)
+                    response = requests.post(endpoint, json=payload, timeout=QWEN_OLLAMA_TIMEOUT)
                     response.raise_for_status()
                     data = response.json()
                     answer = ""

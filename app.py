@@ -8,7 +8,7 @@ from pathlib import Path
 
 import gradio as gr
 import numpy as np
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 from ultralytics import YOLO
 
 from qwen_model import generate_qwen_sku_answer
@@ -301,6 +301,12 @@ button.secondary:hover {
 yolo_model = YOLO("models/yolo/best.pt")
 swin_classifier = load_swin_faiss_classifier()
 
+YOLO_CONF = float(os.getenv("APP_YOLO_CONF", "0.30"))
+MAX_INPUT_EDGE = int(os.getenv("APP_MAX_INPUT_EDGE", "1600"))
+MAX_CROPS_ANALYZE = int(os.getenv("APP_MAX_CROPS_ANALYZE", "80"))
+MAX_CROPS_SKU = int(os.getenv("APP_MAX_CROPS_SKU", "36"))
+MIN_BOX_AREA_RATIO = float(os.getenv("APP_MIN_BOX_AREA_RATIO", "0.00015"))
+
 
 def _clean_label(value):
     return str(value or "").strip()
@@ -340,6 +346,42 @@ def estimate_empty_space(boxes, img_w, img_h, max_dim=640):
     covered = float(mask.sum())
     coverage = covered / (w * h)
     return 1.0 - coverage, coverage
+
+
+def _resize_for_inference(image: Image.Image, max_edge: int):
+    if max_edge <= 0:
+        return image, False
+    w, h = image.size
+    largest = max(w, h)
+    if largest <= max_edge:
+        return image, False
+    scale = max_edge / float(largest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return image.resize((new_w, new_h), Image.Resampling.BILINEAR), True
+
+
+def _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=False):
+    if raw_boxes is None or len(raw_boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32), 0, 0
+
+    image_area = float(max(1, img_w * img_h))
+    filtered = []
+    for box in raw_boxes:
+        x1, y1, x2, y2 = box[:4]
+        area = max(0.0, (x2 - x1) * (y2 - y1))
+        if (area / image_area) >= MIN_BOX_AREA_RATIO:
+            filtered.append(box)
+
+    filtered_count = len(filtered)
+    if not filtered:
+        return np.empty((0, 4), dtype=np.float32), 0, 0
+
+    filtered.sort(key=lambda b: max(0.0, (b[2] - b[0]) * (b[3] - b[1])), reverse=True)
+    limit = MAX_CROPS_SKU if run_qwen else MAX_CROPS_ANALYZE
+    prepared = filtered[: max(1, limit)]
+    skipped_count = max(0, len(filtered) - len(prepared))
+    return np.asarray(prepared, dtype=np.float32), filtered_count, skipped_count
 
 
 def _build_summary_html(rows, empty_ratio, empty_label):
@@ -681,12 +723,14 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
 def process_image_stream(input_image, question, run_qwen=False):
     t0 = time.time()
     image = input_image.convert("RGB")
+    image, resized_for_speed = _resize_for_inference(image, MAX_INPUT_EDGE)
     img_w, img_h = image.size
 
-    results = yolo_model(image, conf=0.25)
+    results = yolo_model(image, conf=YOLO_CONF)
     t_yolo = time.time()
     print(f"[timing] YOLO inference took {t_yolo - t0:.3f}s")
-    boxes = results[0].boxes.xyxy.cpu().numpy()
+    raw_boxes = results[0].boxes.xyxy.cpu().numpy()
+    boxes, filtered_count, skipped_count = _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=run_qwen)
 
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
@@ -695,7 +739,12 @@ def process_image_stream(input_image, question, run_qwen=False):
     empty_ratio, _ = estimate_empty_space(boxes, img_w, img_h)
     empty_label = "High" if empty_ratio >= 0.55 else "Moderate" if empty_ratio >= 0.25 else "Low"
 
-    initial_status = f"Detected {len(boxes)} crop{'s' if len(boxes) != 1 else ''}. Starting {'full SKU extraction' if run_qwen else 'shelf analysis'}..."
+    initial_status = f"Detected {len(raw_boxes)} raw crop{'s' if len(raw_boxes) != 1 else ''}. Processing {len(boxes)} crop{'s' if len(boxes) != 1 else ''}."
+    if skipped_count > 0:
+        initial_status += f" Skipped {skipped_count} low-priority crop{'s' if skipped_count != 1 else ''} for faster response."
+    if resized_for_speed:
+        initial_status += " Image was resized for faster processing."
+    initial_status += f" Starting {'full SKU extraction' if run_qwen else 'shelf analysis'}..."
     yield _compose_stream_payload(
         annotated,
         rows,
