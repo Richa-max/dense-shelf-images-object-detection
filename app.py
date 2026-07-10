@@ -3,6 +3,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -306,6 +307,114 @@ MAX_INPUT_EDGE = int(os.getenv("APP_MAX_INPUT_EDGE", "1600"))
 MAX_CROPS_ANALYZE = int(os.getenv("APP_MAX_CROPS_ANALYZE", "80"))
 MAX_CROPS_SKU = int(os.getenv("APP_MAX_CROPS_SKU", "36"))
 MIN_BOX_AREA_RATIO = float(os.getenv("APP_MIN_BOX_AREA_RATIO", "0.00015"))
+OCCUPANCY_ROW_COUNT = int(os.getenv("APP_OCCUPANCY_ROW_COUNT", "4"))
+ANALYTICS_DB_PATH = os.getenv("APP_ANALYTICS_DB_PATH", "shelf_analytics.db")
+
+
+def _db_connect():
+    return sqlite3.connect(ANALYTICS_DB_PATH)
+
+
+def _init_analytics_db():
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shelf_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                store_id TEXT,
+                shelf_id TEXT,
+                run_mode TEXT NOT NULL,
+                total_products INTEGER NOT NULL,
+                known_products INTEGER NOT NULL,
+                unknown_products INTEGER NOT NULL,
+                occupancy_ratio REAL NOT NULL,
+                row_occupancy_json TEXT,
+                category_mix_json TEXT,
+                subcategory_mix_json TEXT,
+                avg_qwen_conf REAL
+            )
+            """
+        )
+
+
+def _build_mix(rows, key_name):
+    counts = {}
+    for row in rows:
+        label = str(row.get(key_name) or "unknown").strip() or "unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _persist_run_snapshot(rows, occupancy_metrics, run_qwen=False, store_id=None, shelf_id=None):
+    total_products = len(rows)
+    known_products = sum(1 for row in rows if (row.get("product_category") or "unknown").lower() != "unknown")
+    unknown_products = max(0, total_products - known_products)
+    occupancy_ratio = float((occupancy_metrics or {}).get("coverage_ratio", 0.0))
+    row_occupancy = (occupancy_metrics or {}).get("row_occupancy") or []
+
+    qvals = [float(r.get("qwen_confidence")) for r in rows if isinstance(r.get("qwen_confidence"), (int, float))]
+    avg_qwen_conf = (sum(qvals) / len(qvals)) if qvals else None
+
+    category_mix = _build_mix(rows, "product_category")
+    subcategory_mix = _build_mix(rows, "subcategory")
+
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO shelf_runs (
+                created_at, store_id, shelf_id, run_mode,
+                total_products, known_products, unknown_products,
+                occupancy_ratio, row_occupancy_json,
+                category_mix_json, subcategory_mix_json, avg_qwen_conf
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(time.time()),
+                (store_id or "").strip() or None,
+                (shelf_id or "").strip() or None,
+                "full_sku" if run_qwen else "analyze",
+                total_products,
+                known_products,
+                unknown_products,
+                occupancy_ratio,
+                json.dumps(row_occupancy),
+                json.dumps(category_mix),
+                json.dumps(subcategory_mix),
+                avg_qwen_conf,
+            ),
+        )
+
+
+def _load_recent_runs(limit=10, store_id=None, shelf_id=None):
+    limit = max(1, int(limit))
+    where = []
+    params = []
+    if store_id and str(store_id).strip():
+        where.append("store_id = ?")
+        params.append(str(store_id).strip())
+    if shelf_id and str(shelf_id).strip():
+        where.append("shelf_id = ?")
+        params.append(str(shelf_id).strip())
+
+    sql = (
+        "SELECT id, created_at, store_id, shelf_id, run_mode, total_products, known_products, "
+        "unknown_products, occupancy_ratio, row_occupancy_json, category_mix_json, subcategory_mix_json, avg_qwen_conf "
+        "FROM shelf_runs "
+    )
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
+    sql += "ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+
+    with _db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+_init_analytics_db()
 
 
 def _clean_label(value):
@@ -348,6 +457,95 @@ def estimate_empty_space(boxes, img_w, img_h, max_dim=640):
     return 1.0 - coverage, coverage
 
 
+def _empty_label_from_ratio(empty_ratio: float) -> str:
+    if empty_ratio >= 0.55:
+        return "High"
+    if empty_ratio >= 0.25:
+        return "Moderate"
+    return "Low"
+
+
+def estimate_shelf_occupancy(boxes, img_w, img_h, row_count=4, max_dim=640):
+    row_count = max(1, min(int(row_count or 4), 8))
+
+    if boxes is None or len(boxes) == 0:
+        empty_ratio = 1.0
+        return {
+            "empty_ratio": empty_ratio,
+            "coverage_ratio": 0.0,
+            "empty_label": _empty_label_from_ratio(empty_ratio),
+            "shelf_bbox": [0, 0, int(img_w), int(img_h)],
+            "row_occupancy": [0.0 for _ in range(row_count)],
+            "row_empty": [1.0 for _ in range(row_count)],
+        }
+
+    x1 = float(np.min(boxes[:, 0]))
+    y1 = float(np.min(boxes[:, 1]))
+    x2 = float(np.max(boxes[:, 2]))
+    y2 = float(np.max(boxes[:, 3]))
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    pad_x = max(8.0, bw * 0.08)
+    pad_y = max(8.0, bh * 0.10)
+    sx1 = int(max(0, np.floor(x1 - pad_x)))
+    sy1 = int(max(0, np.floor(y1 - pad_y)))
+    sx2 = int(min(img_w, np.ceil(x2 + pad_x)))
+    sy2 = int(min(img_h, np.ceil(y2 + pad_y)))
+
+    if sx2 <= sx1:
+        sx2 = min(img_w, sx1 + 1)
+    if sy2 <= sy1:
+        sy2 = min(img_h, sy1 + 1)
+
+    scale = max(1, max(img_w, img_h) // max_dim)
+    h = max(1, img_h // scale)
+    w = max(1, img_w // scale)
+    mask = np.zeros((h, w), dtype=bool)
+
+    for box in boxes:
+        bx1, by1, bx2, by2 = [int(round(v / scale)) for v in box[:4]]
+        bx1 = max(0, min(bx1, w))
+        bx2 = max(0, min(bx2, w))
+        by1 = max(0, min(by1, h))
+        by2 = max(0, min(by2, h))
+        if bx2 > bx1 and by2 > by1:
+            mask[by1:by2, bx1:bx2] = True
+
+    ssx1 = max(0, min(int(round(sx1 / scale)), w - 1))
+    ssy1 = max(0, min(int(round(sy1 / scale)), h - 1))
+    ssx2 = max(ssx1 + 1, min(int(round(sx2 / scale)), w))
+    ssy2 = max(ssy1 + 1, min(int(round(sy2 / scale)), h))
+
+    shelf_slice = mask[ssy1:ssy2, ssx1:ssx2]
+    shelf_area = float(max(1, shelf_slice.size))
+    covered = float(shelf_slice.sum())
+    coverage = covered / shelf_area
+    empty_ratio = 1.0 - coverage
+
+    row_occupancy = []
+    row_empty = []
+    for i in range(row_count):
+        ry1 = ssy1 + int((i * (ssy2 - ssy1)) / row_count)
+        ry2 = ssy1 + int(((i + 1) * (ssy2 - ssy1)) / row_count)
+        if ry2 <= ry1:
+            ry2 = min(ssy2, ry1 + 1)
+        row_slice = mask[ry1:ry2, ssx1:ssx2]
+        row_area = float(max(1, row_slice.size))
+        row_cov = float(row_slice.sum()) / row_area
+        row_occupancy.append(row_cov)
+        row_empty.append(1.0 - row_cov)
+
+    return {
+        "empty_ratio": empty_ratio,
+        "coverage_ratio": coverage,
+        "empty_label": _empty_label_from_ratio(empty_ratio),
+        "shelf_bbox": [sx1, sy1, sx2, sy2],
+        "row_occupancy": row_occupancy,
+        "row_empty": row_empty,
+    }
+
+
 def _resize_for_inference(image: Image.Image, max_edge: int):
     if max_edge <= 0:
         return image, False
@@ -384,7 +582,7 @@ def _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=False):
     return np.asarray(prepared, dtype=np.float32), filtered_count, skipped_count
 
 
-def _build_summary_html(rows, empty_ratio, empty_label):
+def _build_summary_html(rows, empty_ratio, empty_label, occupancy_metrics=None):
     unique_cats = {}
     unknown_items = []
     for r in rows:
@@ -429,6 +627,14 @@ def _build_summary_html(rows, empty_ratio, empty_label):
         summary_lines.append("<p><strong>Manual review needed:</strong> no unclear items were found.</p>")
 
     summary_lines.append(f"<p><strong>Estimated visible empty space:</strong> {empty_ratio*100:.0f}% ({empty_label}).</p>")
+    if occupancy_metrics:
+        row_occupancy = occupancy_metrics.get("row_occupancy") or []
+        if row_occupancy:
+            row_text = ", ".join([f"Row {idx+1}: {int(round(val*100))}%" for idx, val in enumerate(row_occupancy)])
+            summary_lines.append(f"<p><strong>Row occupancy (planogram zones):</strong> {row_text}</p>")
+            low_rows = [str(idx + 1) for idx, val in enumerate(row_occupancy) if val < 0.35]
+            if low_rows:
+                summary_lines.append(f"<p><strong>Under-utilized rows:</strong> {', '.join(low_rows)} (below 35% occupancy).</p>")
     return "\n".join(summary_lines)
 
 
@@ -594,11 +800,17 @@ def _build_progress_html(processed_count, total_count, run_qwen=False, status_te
     )
 
 
-def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False):
+def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False, occupancy_metrics=None):
     total = len(rows)
     known = sum(1 for row in rows if (row.get("product_category") or "unknown").lower() != "unknown")
     unknown = max(0, total - known)
     occupancy = int(round((1.0 - float(empty_ratio)) * 100)) if total >= 0 else 0
+    row_occupancy = []
+    if occupancy_metrics:
+        row_occupancy = occupancy_metrics.get("row_occupancy") or []
+        coverage = occupancy_metrics.get("coverage_ratio")
+        if isinstance(coverage, (int, float)):
+            occupancy = int(round(float(coverage) * 100))
 
     cat_counts = {}
     for row in rows:
@@ -612,6 +824,14 @@ def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False):
         if qvals:
             avg_qwen = f"{(sum(qvals) / len(qvals))*100:.0f}%"
 
+    rows_html = ""
+    if row_occupancy:
+        chips = " ".join([
+            f"<span style='display:inline-block;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;background:#e8f6f1;border:1px solid #cce2d8;font-size:0.82rem;'>R{idx+1}: {int(round(val*100))}%</span>"
+            for idx, val in enumerate(row_occupancy)
+        ])
+        rows_html = f"<div style='margin-top:8px;'><div class='kpi-label'>Row Occupancy</div>{chips}</div>"
+
     return (
         "<div class='kpi-grid'>"
         f"<div class='kpi-card'><div class='kpi-label'>Shelf Occupancy</div><div class='kpi-value'>{occupancy}%</div></div>"
@@ -619,10 +839,11 @@ def _build_analytics_overview_html(rows, empty_ratio, run_qwen=False):
         f"<div class='kpi-card'><div class='kpi-label'>Top Category</div><div class='kpi-value'>{top_category}</div></div>"
         f"<div class='kpi-card'><div class='kpi-label'>Avg Qwen Confidence</div><div class='kpi-value'>{avg_qwen}</div></div>"
         "</div>"
+        f"{rows_html}"
     )
 
 
-def run_bi_query(selected_query, rows_state):
+def run_bi_query(selected_query, rows_state, store_id=None, shelf_id=None):
     if not rows_state:
         return "<p>No analysis data yet. Run Analyze shelf or Full SKU detection first.</p>"
 
@@ -645,6 +866,43 @@ def run_bi_query(selected_query, rows_state):
 
     total = len(rows)
     unknown_pct = (len(unknown_ids) / total * 100.0) if total else 0.0
+
+    row_count = max(1, min(OCCUPANCY_ROW_COUNT, 8))
+    row_occupancy = []
+    if rows:
+        boxes = []
+        for row in rows:
+            box = row.get("box") or []
+            if isinstance(box, list) and len(box) >= 4:
+                boxes.append(box[:4])
+        if boxes:
+            b = np.asarray(boxes, dtype=np.float32)
+            sx1, sy1 = float(np.min(b[:, 0])), float(np.min(b[:, 1]))
+            sx2, sy2 = float(np.max(b[:, 2])), float(np.max(b[:, 3]))
+            sw = max(1.0, sx2 - sx1)
+            sh = max(1.0, sy2 - sy1)
+            scale = max(1.0, max(sw, sh) / 640.0)
+            mw = max(1, int(round(sw / scale)))
+            mh = max(1, int(round(sh / scale)))
+            mask = np.zeros((mh, mw), dtype=bool)
+            for box in b:
+                x1, y1, x2, y2 = box[:4]
+                lx1 = int(max(0, min(mw, round((x1 - sx1) / scale))))
+                lx2 = int(max(0, min(mw, round((x2 - sx1) / scale))))
+                ly1 = int(max(0, min(mh, round((y1 - sy1) / scale))))
+                ly2 = int(max(0, min(mh, round((y2 - sy1) / scale))))
+                if lx2 > lx1 and ly2 > ly1:
+                    mask[ly1:ly2, lx1:lx2] = True
+
+            for i in range(row_count):
+                ry1 = int((i * mh) / row_count)
+                ry2 = int(((i + 1) * mh) / row_count)
+                if ry2 <= ry1:
+                    ry2 = min(mh, ry1 + 1)
+                row_slice = mask[ry1:ry2, :]
+                row_area = float(max(1, row_slice.size))
+                row_cov = float(row_slice.sum()) / row_area
+                row_occupancy.append(row_cov)
 
     if selected_query == "What are top categories by facings?":
         ordered = sorted(cat_counts.items(), key=lambda kv: -kv[1])
@@ -688,11 +946,91 @@ def run_bi_query(selected_query, rows_state):
             "<p>For planogram hygiene: keep high-frequency categories centered, reduce mixed clutter, and re-check low-confidence crops.</p>"
         )
 
+    if selected_query == "Which row is most under-stocked?":
+        if not row_occupancy:
+            return "<h4>Row occupancy insight</h4><p>Row-wise occupancy is not available yet.</p>"
+        min_idx = int(np.argmin(np.asarray(row_occupancy)))
+        min_val = row_occupancy[min_idx]
+        chips = " ".join([
+            f"<span style='display:inline-block;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;background:#eef8f4;border:1px solid #cce2d8;font-size:0.82rem;'>R{i+1}: {int(round(v*100))}%</span>"
+            for i, v in enumerate(row_occupancy)
+        ])
+        return (
+            "<h4>Row occupancy insight</h4>"
+            f"<p><b>Most under-stocked row:</b> Row {min_idx + 1} at {int(round(min_val*100))}% occupancy.</p>"
+            f"<div>{chips}</div>"
+        )
+
+    if selected_query == "Which row should be replenished first?":
+        if not row_occupancy:
+            return "<h4>Replenishment priority</h4><p>Row-wise occupancy is not available yet.</p>"
+        order = np.argsort(np.asarray(row_occupancy))
+        top_priority = int(order[0])
+        next_priority = int(order[1]) if len(order) > 1 else int(order[0])
+        return (
+            "<h4>Replenishment priority</h4>"
+            f"<p><b>First priority:</b> Row {top_priority + 1} ({int(round(row_occupancy[top_priority]*100))}% occupancy)</p>"
+            f"<p><b>Next priority:</b> Row {next_priority + 1} ({int(round(row_occupancy[next_priority]*100))}% occupancy)</p>"
+            "<p>Recommendation: replenish lowest-occupancy row first, then re-evaluate planogram compliance.</p>"
+        )
+
+    if selected_query == "Show recent run history (SQLite).":
+        recent = _load_recent_runs(limit=10, store_id=store_id, shelf_id=shelf_id)
+        if not recent:
+            return "<h4>Recent run history</h4><p>No persisted runs found yet for this filter.</p>"
+
+        rows_html = []
+        for run in recent:
+            ts = int(run.get("created_at") or 0)
+            occ = float(run.get("occupancy_ratio") or 0.0)
+            rows_html.append(
+                "<tr>"
+                f"<td>{run.get('id')}</td>"
+                f"<td>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}</td>"
+                f"<td>{run.get('store_id') or '-'}</td>"
+                f"<td>{run.get('shelf_id') or '-'}</td>"
+                f"<td>{run.get('run_mode') or '-'}</td>"
+                f"<td>{run.get('total_products') or 0}</td>"
+                f"<td>{int(round(occ * 100))}%</td>"
+                "</tr>"
+            )
+
+        return (
+            "<h4>Recent run history</h4>"
+            "<div class='sku-table-wrap'><table class='sku-table'>"
+            "<thead><tr><th>ID</th><th>Timestamp</th><th>Store</th><th>Shelf</th><th>Mode</th><th>Products</th><th>Occupancy</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></div>"
+        )
+
+    if selected_query == "How has occupancy changed recently?":
+        recent = _load_recent_runs(limit=8, store_id=store_id, shelf_id=shelf_id)
+        if len(recent) < 2:
+            return "<h4>Occupancy trend</h4><p>Need at least two saved runs to compute trend.</p>"
+
+        latest = recent[0]
+        prev = recent[1]
+        latest_occ = float(latest.get("occupancy_ratio") or 0.0)
+        prev_occ = float(prev.get("occupancy_ratio") or 0.0)
+        delta = (latest_occ - prev_occ) * 100.0
+        trend = "up" if delta > 0.01 else "down" if delta < -0.01 else "flat"
+
+        spark_points = []
+        for run in reversed(recent):
+            occ = int(round(float(run.get("occupancy_ratio") or 0.0) * 100))
+            spark_points.append(str(occ))
+
+        return (
+            "<h4>Occupancy trend</h4>"
+            f"<p><b>Latest occupancy:</b> {int(round(latest_occ*100))}%</p>"
+            f"<p><b>Change vs previous run:</b> {delta:+.1f} percentage points ({trend})</p>"
+            f"<p><b>Recent sequence (%):</b> {' → '.join(spark_points)}</p>"
+        )
+
     return "<p>Select a BI query and click Run BI Query.</p>"
 
 
-def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label, run_qwen=False, status_text=None, processed_count=0, total_count=0):
-    summary_html = _build_summary_html(rows, empty_ratio, empty_label)
+def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label, run_qwen=False, status_text=None, processed_count=0, total_count=0, occupancy_metrics=None):
+    summary_html = _build_summary_html(rows, empty_ratio, empty_label, occupancy_metrics=occupancy_metrics)
     summary_html = f"{summary_html}\n{_build_detected_items_html(rows, run_qwen=run_qwen)}"
     answer_html = _build_answer_html(question, rows, empty_ratio, empty_label)
     if status_text:
@@ -704,7 +1042,7 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
     sku_results_html = _build_sku_results_html(rows, run_qwen=run_qwen)
     kpi_html = _build_kpi_html(rows, run_qwen=run_qwen)
     sku_table_html = _build_sku_table_html(rows, run_qwen=run_qwen)
-    analytics_html = _build_analytics_overview_html(rows, empty_ratio, run_qwen=run_qwen)
+    analytics_html = _build_analytics_overview_html(rows, empty_ratio, run_qwen=run_qwen, occupancy_metrics=occupancy_metrics)
 
     return (
         annotated,
@@ -720,7 +1058,7 @@ def _compose_stream_payload(annotated, rows, question, empty_ratio, empty_label,
     )
 
 
-def process_image_stream(input_image, question, run_qwen=False):
+def process_image_stream(input_image, question, run_qwen=False, store_id=None, shelf_id=None):
     t0 = time.time()
     image = input_image.convert("RGB")
     image, resized_for_speed = _resize_for_inference(image, MAX_INPUT_EDGE)
@@ -736,8 +1074,20 @@ def process_image_stream(input_image, question, run_qwen=False):
     draw = ImageDraw.Draw(annotated)
 
     rows = []
-    empty_ratio, _ = estimate_empty_space(boxes, img_w, img_h)
-    empty_label = "High" if empty_ratio >= 0.55 else "Moderate" if empty_ratio >= 0.25 else "Low"
+    occupancy_metrics = estimate_shelf_occupancy(
+        boxes,
+        img_w,
+        img_h,
+        row_count=OCCUPANCY_ROW_COUNT,
+    )
+    empty_ratio = float(occupancy_metrics.get("empty_ratio", 1.0))
+    empty_label = occupancy_metrics.get("empty_label") or _empty_label_from_ratio(empty_ratio)
+
+    shelf_bbox = occupancy_metrics.get("shelf_bbox") or [0, 0, img_w, img_h]
+    if len(shelf_bbox) == 4:
+        sx1, sy1, sx2, sy2 = [int(v) for v in shelf_bbox]
+        draw.rectangle((sx1, sy1, sx2, sy2), outline="#2563eb", width=2)
+        draw.text((sx1, max(0, sy1 - 12)), "shelf region", fill="#2563eb")
 
     initial_status = f"Detected {len(raw_boxes)} raw crop{'s' if len(raw_boxes) != 1 else ''}. Processing {len(boxes)} crop{'s' if len(boxes) != 1 else ''}."
     if skipped_count > 0:
@@ -755,6 +1105,7 @@ def process_image_stream(input_image, question, run_qwen=False):
         status_text=initial_status,
         processed_count=0,
         total_count=len(boxes),
+        occupancy_metrics=occupancy_metrics,
     )
 
     def _looks_like_path_label(label: str) -> bool:
@@ -870,9 +1221,20 @@ def process_image_stream(input_image, question, run_qwen=False):
             status_text=progress_status,
             processed_count=i + 1,
             total_count=len(boxes),
+            occupancy_metrics=occupancy_metrics,
         )
 
     final_status = f"Completed processing {len(rows)} crop{'s' if len(rows) != 1 else ''}."
+
+    # Persist deterministic run metrics for cross-run BI without requiring an LLM or external DB service.
+    _persist_run_snapshot(
+        rows=rows,
+        occupancy_metrics=occupancy_metrics,
+        run_qwen=run_qwen,
+        store_id=store_id,
+        shelf_id=shelf_id,
+    )
+
     yield _compose_stream_payload(
         annotated,
         rows,
@@ -883,15 +1245,28 @@ def process_image_stream(input_image, question, run_qwen=False):
         status_text=final_status,
         processed_count=len(rows),
         total_count=len(boxes),
+        occupancy_metrics=occupancy_metrics,
     )
 
 
-def analyze_shelf(input_image, question):
-    yield from process_image_stream(input_image, question, run_qwen=False)
+def analyze_shelf(input_image, question, store_id, shelf_id):
+    yield from process_image_stream(
+        input_image,
+        question,
+        run_qwen=False,
+        store_id=store_id,
+        shelf_id=shelf_id,
+    )
 
 
-def run_full_shelf_sku(input_image, question):
-    yield from process_image_stream(input_image, question, run_qwen=True)
+def run_full_shelf_sku(input_image, question, store_id, shelf_id):
+    yield from process_image_stream(
+        input_image,
+        question,
+        run_qwen=True,
+        store_id=store_id,
+        shelf_id=shelf_id,
+    )
 
 
 def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
@@ -1006,6 +1381,9 @@ with gr.Blocks(
                     value="How many products were detected on this shelf?",
                     label="Select a Store Management question",
                 )
+            with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-1"]):
+                store_id_input = gr.Textbox(label="Store ID", placeholder="e.g. store_001")
+                shelf_id_input = gr.Textbox(label="Shelf ID", placeholder="e.g. snacks_aisle_left")
             with gr.Row(elem_classes=["toolbar", "animate-in", "stagger-2"]):
                 analyze_button = gr.Button("Analyze shelf", variant="secondary")
                 sku_button = gr.Button("Run full shelf SKU detection", variant="primary")
@@ -1046,6 +1424,10 @@ with gr.Blocks(
                         "What is the unknown-rate and confidence risk?",
                         "Show likely assortment mix (category and subcategory).",
                         "Give replenishment and planogram suggestions.",
+                        "Which row is most under-stocked?",
+                        "Which row should be replenished first?",
+                        "Show recent run history (SQLite).",
+                        "How has occupancy changed recently?",
                     ],
                     value="What are top categories by facings?",
                     label="Business Intelligence Query",
@@ -1055,12 +1437,12 @@ with gr.Blocks(
 
     analyze_button.click(
         analyze_shelf,
-        inputs=[image_input, question_input],
+        inputs=[image_input, question_input, store_id_input, shelf_id_input],
         outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
     )
     sku_button.click(
         run_full_shelf_sku,
-        inputs=[image_input, question_input],
+        inputs=[image_input, question_input, store_id_input, shelf_id_input],
         outputs=[output_image, output_summary, output_answer, output_progress, crop_selector, rows_state, output_sku_results, kpi_cards, output_sku_table, analytics_overview],
     )
     save_button.click(
@@ -1075,7 +1457,7 @@ with gr.Blocks(
     )
     bi_button.click(
         run_bi_query,
-        inputs=[bi_query, rows_state],
+        inputs=[bi_query, rows_state, store_id_input, shelf_id_input],
         outputs=[bi_query_output],
     )
 
