@@ -3,6 +3,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -421,6 +422,37 @@ def _clean_label(value):
     return str(value or "").strip()
 
 
+def _normalize_semantic_label(value):
+    text = _clean_label(value).lower()
+    if text in {"", "unknown", "none", "n/a", "na"}:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    tokens = [tok for tok in text.split() if tok]
+    normalized_tokens = []
+    for token in tokens:
+        if len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        normalized_tokens.append(token)
+    return " ".join(normalized_tokens)
+
+
+def _semantic_match_labels(left, right):
+    a = _normalize_semantic_label(left)
+    b = _normalize_semantic_label(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    aset = set(a.split())
+    bset = set(b.split())
+    if not aset or not bset:
+        return False
+    overlap = len(aset & bset) / float(max(1, min(len(aset), len(bset))))
+    return overlap >= 0.6
+
+
 def _is_distinct_product_name(product, category, subcategory):
     product = _clean_label(product)
     if not product or product.lower() in {"unknown", "none", "n/a", "na"}:
@@ -612,6 +644,7 @@ def _build_summary_html(rows, empty_ratio, empty_label, occupancy_metrics=None):
     else:
         summary_lines.append("<p><strong>Top categories:</strong> none detected yet.</p>")
 
+
     retail_summary = summarize_retail_decisions(rows)
     top_products = retail_summary.get("top_products") or []
     if top_products:
@@ -625,6 +658,11 @@ def _build_summary_html(rows, empty_ratio, empty_label, occupancy_metrics=None):
         summary_lines.append(f"<p><strong>Manual review needed:</strong> {len(unknown_items)} item{'s' if len(unknown_items) != 1 else ''} may be unclear and should be checked manually.</p>")
     else:
         summary_lines.append("<p><strong>Manual review needed:</strong> no unclear items were found.</p>")
+
+
+    mismatch_count = sum(1 for r in rows if bool(r.get("semantic_mismatch_flag")))
+    if mismatch_count > 0:
+        summary_lines.append(f"<p><strong>Analyze vs Qwen mismatches:</strong> {mismatch_count} item{'s' if mismatch_count != 1 else ''} need label review.</p>")
 
     summary_lines.append(f"<p><strong>Estimated visible empty space:</strong> {empty_ratio*100:.0f}% ({empty_label}).</p>")
     if occupancy_metrics:
@@ -664,7 +702,7 @@ def _build_sku_table_html(rows, run_qwen=False):
 
     lines = [
         "<div class='sku-table-wrap'><table class='sku-table'>",
-        "<thead><tr><th>Crop</th><th>SKU / Product</th><th>Category</th><th>Subcategory</th><th>Clues</th><th>Confidence</th></tr></thead>",
+        "<thead><tr><th>Crop</th><th>SKU / Product</th><th>Analyze Category</th><th>Analyze Subcategory</th><th>Qwen Category</th><th>Qwen Subcategory</th><th>Semantic Match</th><th>Clues</th><th>Confidence</th></tr></thead>",
         "<tbody>",
     ]
     for row in rows:
@@ -672,6 +710,11 @@ def _build_sku_table_html(rows, run_qwen=False):
         sku_detail = row.get("sku_detail") or "No SKU detected"
         category = row.get("product_category") or "unknown"
         subcategory = row.get("subcategory") or "unknown"
+        analyze_category = row.get("analyze_category") or "unknown"
+        analyze_subcategory = row.get("analyze_subcategory") or "unknown"
+        match_label = "Matched"
+        if bool(row.get("semantic_mismatch_flag")):
+            match_label = "Mismatch"
         clues = row.get("qwen_clues") or []
         clues_text = "; ".join(clues) if clues else "-"
         confidence = row.get("qwen_confidence")
@@ -681,7 +724,7 @@ def _build_sku_table_html(rows, run_qwen=False):
             confidence_text = f"{confidence*100:.0f}% ({confidence_label})"
 
         lines.append(
-            f"<tr><td>{crop_id}</td><td>{sku_detail}</td><td>{category}</td><td>{subcategory}</td><td>{clues_text}</td><td>{confidence_text}</td></tr>"
+            f"<tr><td>{crop_id}</td><td>{sku_detail}</td><td>{analyze_category}</td><td>{analyze_subcategory}</td><td>{category}</td><td>{subcategory}</td><td>{match_label}</td><td>{clues_text}</td><td>{confidence_text}</td></tr>"
         )
 
     lines.extend(["</tbody>", "</table></div>"])
@@ -706,8 +749,15 @@ def _build_detected_items_html(rows, run_qwen=False):
             clues_suffix = ""
             if qwen_clues:
                 clues_suffix = f"<br><i>Clues:</i> {'; '.join(qwen_clues)}"
+            mismatch_suffix = ""
+            if run_qwen and bool(r.get("semantic_mismatch_flag")):
+                acat = r.get("analyze_category") or "unknown"
+                asub = r.get("analyze_subcategory") or "unknown"
+                qcat = r.get("product_category") or "unknown"
+                qsub = r.get("subcategory") or "unknown"
+                mismatch_suffix = f"<br><b>Mismatch flagged:</b> Analyze({acat} / {asub}) vs Qwen({qcat} / {qsub})"
             if cat.lower() == "unknown":
-                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}{qwen_confidence_suffix}{clues_suffix}" if run_qwen else ""
+                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}{qwen_confidence_suffix}{clues_suffix}{mismatch_suffix}" if run_qwen else ""
                 list_html += f"<li><b>Item {cid}</b> could not be confidently identified and should be reviewed.{qwen_line}</li>"
             else:
                 retail_decision = (r.get("retail_product") or {}).get("decision") or {}
@@ -719,7 +769,7 @@ def _build_detected_items_html(rows, run_qwen=False):
                 retail_confidence_suffix = ""
                 if isinstance(retail_confidence, (int, float)):
                     retail_confidence_suffix = f" ({retail_confidence*100:.0f}% confidence)"
-                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}{qwen_confidence_suffix}{clues_suffix}" if run_qwen else ""
+                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}{qwen_confidence_suffix}{clues_suffix}{mismatch_suffix}" if run_qwen else ""
                 list_html += f"<li><b>Item {cid}</b> is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{retail_confidence_suffix}.{qwen_line}</li>"
         list_html += "</ol></details>"
     else:
@@ -974,6 +1024,61 @@ def run_bi_query(selected_query, rows_state, store_id=None, shelf_id=None):
             "<p>Recommendation: replenish lowest-occupancy row first, then re-evaluate planogram compliance.</p>"
         )
 
+    if selected_query == "Show Analyze vs Qwen mismatches (semantic).":
+        mismatch_rows = []
+        for row in rows:
+            if not bool(row.get("semantic_mismatch_flag")):
+                continue
+            crop_id = row.get("crop_id")
+            analyze_category = row.get("analyze_category") or "unknown"
+            analyze_subcategory = row.get("analyze_subcategory") or "unknown"
+            qwen_category = row.get("product_category") or "unknown"
+            qwen_subcategory = row.get("subcategory") or "unknown"
+
+            category_match = row.get("semantic_match_category")
+            subcategory_match = row.get("semantic_match_subcategory")
+            category_match_label = "Matched" if category_match else "Mismatch"
+            subcategory_match_label = "Matched" if subcategory_match else "Mismatch"
+
+            mismatch_type = []
+            if not category_match:
+                mismatch_type.append("Category")
+            if not subcategory_match:
+                mismatch_type.append("Subcategory")
+            mismatch_type_text = " + ".join(mismatch_type) if mismatch_type else "Unknown"
+
+            qconf = row.get("qwen_confidence")
+            qconf_text = f"{qconf*100:.0f}%" if isinstance(qconf, (int, float)) else "N/A"
+
+            mismatch_rows.append(
+                "<tr>"
+                f"<td>{crop_id}</td>"
+                f"<td>{analyze_category}</td>"
+                f"<td>{analyze_subcategory}</td>"
+                f"<td>{qwen_category}</td>"
+                f"<td>{qwen_subcategory}</td>"
+                f"<td>{category_match_label}</td>"
+                f"<td>{subcategory_match_label}</td>"
+                f"<td>{mismatch_type_text}</td>"
+                f"<td>{qconf_text}</td>"
+                "</tr>"
+            )
+
+        if not mismatch_rows:
+            return (
+                "<h4>Analyze vs Qwen mismatches</h4>"
+                "<p>No semantic mismatches found in current rows. "
+                "Run Full SKU detection to populate semantic comparison fields.</p>"
+            )
+
+        return (
+            "<h4>Analyze vs Qwen mismatches</h4>"
+            f"<p><b>Total mismatches:</b> {len(mismatch_rows)}</p>"
+            "<div class='sku-table-wrap'><table class='sku-table'>"
+            "<thead><tr><th>Crop</th><th>Analyze Category</th><th>Analyze Subcategory</th><th>Qwen Category</th><th>Qwen Subcategory</th><th>Category Match</th><th>Subcategory Match</th><th>Mismatch Type</th><th>Qwen Confidence</th></tr></thead>"
+            f"<tbody>{''.join(mismatch_rows)}</tbody></table></div>"
+        )
+
     if selected_query == "Show recent run history (SQLite).":
         recent = _load_recent_runs(limit=10, store_id=store_id, shelf_id=shelf_id)
         if not recent:
@@ -1177,6 +1282,13 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
         qwen_confidence = None
         qwen_confidence_label = None
         qwen_clues = []
+        qwen_category = None
+        qwen_subcategory = None
+        analyze_category = final_category
+        analyze_subcategory = subcategory_label
+        semantic_match_category = None
+        semantic_match_subcategory = None
+        semantic_mismatch_flag = None
         if run_qwen:
             sku_prompt = (
                 "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
@@ -1188,6 +1300,16 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
             qwen_confidence_label = sku_result.get("confidence_label")
             structured = sku_result.get("structured") or {}
             qwen_clues = structured.get("clues") or []
+            qwen_category = _clean_label(structured.get("category") or "")
+            qwen_subcategory = _clean_label(structured.get("subcategory") or "")
+
+            # Full SKU mode should use Qwen category/subcategory outputs.
+            final_category = qwen_category if qwen_category else "unknown"
+            subcategory_label = qwen_subcategory if qwen_subcategory else "unknown"
+
+            semantic_match_category = _semantic_match_labels(analyze_category, final_category)
+            semantic_match_subcategory = _semantic_match_labels(analyze_subcategory, subcategory_label)
+            semantic_mismatch_flag = not (semantic_match_category and semantic_match_subcategory)
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
@@ -1207,6 +1329,13 @@ def process_image_stream(input_image, question, run_qwen=False, store_id=None, s
                 "qwen_confidence": qwen_confidence,
                 "qwen_confidence_label": qwen_confidence_label,
                 "qwen_clues": qwen_clues,
+                "analyze_category": analyze_category,
+                "analyze_subcategory": analyze_subcategory,
+                "qwen_category": qwen_category,
+                "qwen_subcategory": qwen_subcategory,
+                "semantic_match_category": semantic_match_category,
+                "semantic_match_subcategory": semantic_match_subcategory,
+                "semantic_mismatch_flag": semantic_mismatch_flag,
             }
         )
 
@@ -1329,6 +1458,11 @@ def get_selected_crop_details(selected_crop_id, rows_state):
 
         confidence_text = f"{confidence*100:.0f}% ({confidence_label})" if isinstance(confidence, (int, float)) else "Not available"
         mapped_confidence_text = f"{mapped_confidence*100:.0f}%" if isinstance(mapped_confidence, (int, float)) else "Not available"
+        analyze_category = row.get("analyze_category") or "unknown"
+        analyze_subcategory = row.get("analyze_subcategory") or "unknown"
+        semantic_match_label = "Matched"
+        if bool(row.get("semantic_mismatch_flag")):
+            semantic_match_label = "Mismatch"
 
         details_html = (
             f"<h4>Crop {crop_id} mapping details</h4>"
@@ -1336,8 +1470,11 @@ def get_selected_crop_details(selected_crop_id, rows_state):
             "<thead><tr><th>Field</th><th>Value</th></tr></thead>"
             "<tbody>"
             f"<tr><td>Mapped Product</td><td>{mapped_product}</td></tr>"
-            f"<tr><td>Mapped Category</td><td>{category}</td></tr>"
-            f"<tr><td>Mapped Subcategory</td><td>{subcategory}</td></tr>"
+            f"<tr><td>Analyze Category</td><td>{analyze_category}</td></tr>"
+            f"<tr><td>Analyze Subcategory</td><td>{analyze_subcategory}</td></tr>"
+            f"<tr><td>Qwen Category</td><td>{category}</td></tr>"
+            f"<tr><td>Qwen Subcategory</td><td>{subcategory}</td></tr>"
+            f"<tr><td>Semantic Comparison</td><td>{semantic_match_label}</td></tr>"
             f"<tr><td>Qwen SKU / Product</td><td>{sku_detail}</td></tr>"
             f"<tr><td>Qwen Confidence</td><td>{confidence_text}</td></tr>"
             f"<tr><td>Resolver Confidence</td><td>{mapped_confidence_text}</td></tr>"
@@ -1426,6 +1563,7 @@ with gr.Blocks(
                         "Give replenishment and planogram suggestions.",
                         "Which row is most under-stocked?",
                         "Which row should be replenished first?",
+                        "Show Analyze vs Qwen mismatches (semantic).",
                         "Show recent run history (SQLite).",
                         "How has occupancy changed recently?",
                     ],
