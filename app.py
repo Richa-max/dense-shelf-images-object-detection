@@ -405,6 +405,7 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
         output_summary = gr.HTML(label="Summary")
         output_answer = gr.HTML(label="Selected question answer")
     output_sku_results = gr.HTML(label="Full shelf SKU results")
+    crop_selector = gr.Dropdown(choices=[], label="Select crop id to flag/save")
     with gr.Row():
         flag_reason = gr.Textbox(label="Flag reason if SKU is unclear", placeholder="e.g. blurry, occluded, no visible barcode")
         save_button = gr.Button("Flag and save selected crop")
