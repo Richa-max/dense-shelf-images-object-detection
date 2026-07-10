@@ -833,9 +833,13 @@ def _prepare_boxes(raw_boxes, img_w, img_h, run_qwen=False):
         return np.empty((0, 4), dtype=np.float32), 0, 0
 
     filtered.sort(key=lambda b: max(0.0, (b[2] - b[0]) * (b[3] - b[1])), reverse=True)
-    limit = MAX_CROPS_SKU if run_qwen else MAX_CROPS_ANALYZE
-    prepared = filtered[: max(1, limit)]
-    skipped_count = max(0, len(filtered) - len(prepared))
+    if run_qwen:
+        prepared = filtered[: max(1, MAX_CROPS_SKU)]
+        skipped_count = max(0, len(filtered) - len(prepared))
+    else:
+        # Analyze mode should run full-shelf detection over all filtered crops.
+        prepared = filtered
+        skipped_count = 0
     return np.asarray(prepared, dtype=np.float32), filtered_count, skipped_count
 
 
