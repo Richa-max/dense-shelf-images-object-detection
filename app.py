@@ -235,6 +235,17 @@ def process_image(input_image, question):
         if final_category == "unknown":
             unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
 
+        sku_prompt = (
+            "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
+            "Return a concise answer only."
+        )
+        sku_result = generate_llava4_answer(
+            image=crop,
+            broad_category=final_category,
+            user_prompt=sku_prompt,
+        )
+        sku_detail = (sku_result.get("answer") or "").strip() or (sku_result.get("error") or "No SKU detected")
+
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
 
@@ -249,6 +260,7 @@ def process_image(input_image, question):
                 "llava_subcategory": {"answer": None, "status": "disabled"},
                 "retail_product": retail_product,
                 "crop_image": crop,
+                "sku_detail": sku_detail,
             }
         )
 
@@ -282,8 +294,9 @@ def process_image(input_image, question):
             cid = r["crop_id"]
             cat = r.get("product_category") or "unknown"
             sub = r.get("subcategory") or "unknown"
+            sku_detail = r.get("sku_detail") or "No SKU detected"
             if cat.lower() == "unknown":
-                list_html += f"<li>Item {cid} could not be confidently identified and should be reviewed.</li>"
+                list_html += f"<li><b>Item {cid}</b> could not be confidently identified and should be reviewed.<br><i>Qwen 2.5 VL:</i> {sku_detail}</li>"
             else:
                 retail_decision = (r.get("retail_product") or {}).get("decision") or {}
                 product = retail_decision.get("predicted_product")
@@ -294,7 +307,7 @@ def process_image(input_image, question):
                 confidence_suffix = ""
                 if isinstance(confidence, (int, float)):
                     confidence_suffix = f" ({confidence*100:.0f}% confidence)"
-                list_html += f"<li>Item {cid} is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.</li>"
+                list_html += f"<li><b>Item {cid}</b> is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.<br><i>Qwen 2.5 VL:</i> {sku_detail}</li>"
         list_html += "</ol></details>"
     else:
         list_html += "<p>No product items were found in the image.</p>"
@@ -325,7 +338,17 @@ def process_image(input_image, question):
     answer_html = f"<p><b>{question}</b><br>{selected_answer}</p>"
     box_choices = [str(r["crop_id"]) for r in rows]
     initial_choice = box_choices[0] if box_choices else None
-    return annotated, summary_html, answer_html, gr.update(choices=box_choices, value=initial_choice), rows
+    sku_results_html = "<h4>Full shelf SKU results</h4>"
+    if rows:
+        sku_results_html += "<ol>"
+        for r in rows:
+            cid = r["crop_id"]
+            sku_detail = r.get("sku_detail") or "No SKU detected"
+            sku_results_html += f"<li><b>Crop {cid}</b>: {sku_detail}</li>"
+        sku_results_html += "</ol>"
+    else:
+        sku_results_html += "<p>No crops were available for SKU analysis.</p>"
+    return annotated, summary_html, answer_html, gr.update(choices=box_choices, value=initial_choice), rows, sku_results_html
 
 
 def inspect_selected_crop(selected_crop_id, rows_state):
@@ -392,7 +415,7 @@ def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
 
 
 with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
-    gr.Markdown("Upload a shelf image to detect product categories and inspect a specific boxed item with LLaVA.")
+    gr.Markdown("Upload a shelf image to detect product categories and run full-shelf SKU extraction over every detected crop with Qwen 2.5 VL.")
     with gr.Row():
         image_input = gr.Image(type="pil", label="Upload shelf image")
         question_input = gr.Dropdown(
@@ -407,10 +430,12 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
             label="Select a Store Management question",
         )
     analyze_button = gr.Button("Analyze shelf")
+    sku_button = gr.Button("Run full shelf SKU detection")
     with gr.Row():
         output_image = gr.Image(type="pil", label="Annotated image")
         output_summary = gr.HTML(label="Summary")
         output_answer = gr.HTML(label="Selected question answer")
+    output_sku_results = gr.HTML(label="Full shelf SKU results")
     with gr.Row():
         crop_selector = gr.Dropdown(choices=[], label="Select a detected box to inspect")
         inspect_button = gr.Button("Inspect selected box with LLaVA")
@@ -428,7 +453,12 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
     analyze_button.click(
         process_image,
         inputs=[image_input, question_input],
-        outputs=[output_image, output_summary, output_answer, crop_selector, rows_state],
+        outputs=[output_image, output_summary, output_answer, crop_selector, rows_state, output_sku_results],
+    )
+    sku_button.click(
+        process_image,
+        inputs=[image_input, question_input],
+        outputs=[output_image, output_summary, output_answer, crop_selector, rows_state, output_sku_results],
     )
     inspect_button.click(
         inspect_selected_crop,

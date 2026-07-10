@@ -12,10 +12,10 @@ except Exception:  # pragma: no cover
 
 
 LLAVA_PROVIDER = os.getenv("LLAVA_PROVIDER", "ollama").strip().lower()
-LLAVA4_MODEL_ID = os.getenv("LLAVA4_MODEL_ID", "llava-hf/llava-1.5-7b-hf")
-LLAVA4_MAX_NEW_TOKENS = int(os.getenv("LLAVA4_MAX_NEW_TOKENS", "64"))
+LLAVA4_MODEL_ID = os.getenv("LLAVA4_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+LLAVA4_MAX_NEW_TOKENS = int(os.getenv("LLAVA4_MAX_NEW_TOKENS", "96"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava:13b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b")
 
 
 def _build_prompt(broad_category: Optional[str], user_prompt: Optional[str]) -> str:
@@ -24,12 +24,13 @@ def _build_prompt(broad_category: Optional[str], user_prompt: Optional[str]) -> 
     elif broad_category:
         task = (
             f"The product likely belongs to '{broad_category}'. "
-            "Identify the exact retail product name, brand, or SKU visible in the crop."
+            "Identify the exact SKU, product name, brand, category, and subcategory visible in the crop. "
+            "Return a concise answer only."
         )
     else:
-        task = "Identify the exact retail product name, brand, or SKU visible in the crop."
+        task = "Identify the exact SKU, product name, brand, category, and subcategory visible in the crop. Return a concise answer only."
 
-    return f"USER: <image>\n{task}\nReturn a short answer only.\nASSISTANT:"
+    return f"USER: <image>\n{task}\nASSISTANT:"
 
 
 def generate_llava4_answer(
