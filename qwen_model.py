@@ -18,6 +18,56 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip(
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", os.getenv("QWEN_OLLAMA_MODEL", "qwen2.5vl:3b"))
 
 
+def _contains_non_ascii_text(text: str) -> bool:
+    if not text:
+        return False
+    return any(ord(ch) > 127 for ch in text)
+
+
+def _translate_to_english_ollama(text: str) -> str:
+    if not text or requests is None:
+        return text
+
+    prompt = (
+        "Translate the following text to English. "
+        "Return only the translated English text without any explanation:\n\n"
+        f"{text}"
+    )
+    base_url = OLLAMA_BASE_URL.rstrip("/")
+    endpoints = [f"{base_url}/api/generate", f"{base_url}/api/chat"]
+    payloads = [
+        {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
+        },
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"num_predict": QWEN_MAX_NEW_TOKENS},
+        },
+    ]
+
+    for endpoint, payload in zip(endpoints, payloads):
+        try:
+            response = requests.post(endpoint, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            if endpoint.endswith("/api/generate"):
+                translated = str(data.get("response") or "").strip()
+            else:
+                message = data.get("message") or {}
+                translated = str(message.get("content") or "").strip()
+            if translated:
+                return translated
+        except Exception:
+            continue
+
+    return text
+
+
 def _build_prompt(broad_category: Optional[str], user_prompt: Optional[str]) -> str:
     if user_prompt and user_prompt.strip():
         task = user_prompt.strip()
@@ -30,7 +80,7 @@ def _build_prompt(broad_category: Optional[str], user_prompt: Optional[str]) -> 
     else:
         task = "Identify the exact SKU, product name, brand, category, and subcategory visible in the crop. Return a concise answer only."
 
-    return f"USER: <image>\n{task}\nASSISTANT:"
+    return f"USER: <image>\n{task}\nRespond in English only.\nASSISTANT:"
 
 
 def generate_qwen_sku_answer(
@@ -85,6 +135,9 @@ def generate_qwen_sku_answer(
                     else:
                         message = data.get("message") or {}
                         answer = str(message.get("content") or "").strip()
+                    if answer and _contains_non_ascii_text(answer):
+                        answer = _translate_to_english_ollama(answer)
+
                     if answer:
                         return {
                             "provider": "ollama",

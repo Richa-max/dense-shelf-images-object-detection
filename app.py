@@ -138,7 +138,7 @@ def _build_summary_html(rows, empty_ratio, empty_label):
     return "\n".join(summary_lines)
 
 
-def process_image(input_image, question):
+def process_image(input_image, question, run_qwen=False):
     t0 = time.time()
     image = input_image.convert("RGB")
     img_w, img_h = image.size
@@ -235,16 +235,18 @@ def process_image(input_image, question):
         if final_category == "unknown":
             unknown_path = swin_classifier.save_unknown_crop(crop, i + 1)
 
-        sku_prompt = (
-            "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
-            "Return a concise answer only."
-        )
-        sku_result = generate_qwen_sku_answer(
-            image=crop,
-            broad_category=final_category,
-            user_prompt=sku_prompt,
-        )
-        sku_detail = (sku_result.get("answer") or "").strip() or (sku_result.get("error") or "No SKU detected")
+        sku_detail = "Qwen SKU detection not run in Analyze Shelf mode."
+        if run_qwen:
+            sku_prompt = (
+                "Identify the exact SKU, product name, brand, category, and subcategory visible in this crop. "
+                "Respond in English only. Return a concise answer only."
+            )
+            sku_result = generate_qwen_sku_answer(
+                image=crop,
+                broad_category=final_category,
+                user_prompt=sku_prompt,
+            )
+            sku_detail = (sku_result.get("answer") or "").strip() or (sku_result.get("error") or "No SKU detected")
 
         draw.rectangle((px1, py1, px2, py2), outline="red", width=3)
         draw.text((px1, max(0, py1 - 12)), str(final_category), fill="red")
@@ -296,7 +298,8 @@ def process_image(input_image, question):
             sub = r.get("subcategory") or "unknown"
             sku_detail = r.get("sku_detail") or "No SKU detected"
             if cat.lower() == "unknown":
-                list_html += f"<li><b>Item {cid}</b> could not be confidently identified and should be reviewed.<br><i>Qwen 2.5 VL:</i> {sku_detail}</li>"
+                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}" if run_qwen else ""
+                list_html += f"<li><b>Item {cid}</b> could not be confidently identified and should be reviewed.{qwen_line}</li>"
             else:
                 retail_decision = (r.get("retail_product") or {}).get("decision") or {}
                 product = retail_decision.get("predicted_product")
@@ -307,7 +310,8 @@ def process_image(input_image, question):
                 confidence_suffix = ""
                 if isinstance(confidence, (int, float)):
                     confidence_suffix = f" ({confidence*100:.0f}% confidence)"
-                list_html += f"<li><b>Item {cid}</b> is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.<br><i>Qwen 2.5 VL:</i> {sku_detail}</li>"
+                qwen_line = f"<br><i>Qwen 2.5 VL:</i> {sku_detail}" if run_qwen else ""
+                list_html += f"<li><b>Item {cid}</b> is likely {product_prefix}<strong>{cat}</strong> with subcategory <strong>{sub}</strong>{confidence_suffix}.{qwen_line}</li>"
         list_html += "</ol></details>"
     else:
         list_html += "<p>No product items were found in the image.</p>"
@@ -339,7 +343,9 @@ def process_image(input_image, question):
     box_choices = [str(r["crop_id"]) for r in rows]
     initial_choice = box_choices[0] if box_choices else None
     sku_results_html = "<h4>Full shelf SKU results</h4>"
-    if rows:
+    if not run_qwen:
+        sku_results_html += "<p>Qwen SKU extraction is skipped in Analyze Shelf mode. Use the Full Shelf SKU button.</p>"
+    elif rows:
         sku_results_html += "<ol>"
         for r in rows:
             cid = r["crop_id"]
@@ -349,6 +355,14 @@ def process_image(input_image, question):
     else:
         sku_results_html += "<p>No crops were available for SKU analysis.</p>"
     return annotated, summary_html, answer_html, gr.update(choices=box_choices, value=initial_choice), rows, sku_results_html
+
+
+def analyze_shelf(input_image, question):
+    return process_image(input_image, question, run_qwen=False)
+
+
+def run_full_shelf_sku(input_image, question):
+    return process_image(input_image, question, run_qwen=True)
 
 
 def save_flagged_crop(selected_crop_id, rows_state, flag_reason, save_image):
@@ -415,12 +429,12 @@ with gr.Blocks(title="Smart Shelf Management Dashboard") as demo:
     rows_state = gr.State(value=[])
 
     analyze_button.click(
-        process_image,
+        analyze_shelf,
         inputs=[image_input, question_input],
         outputs=[output_image, output_summary, output_answer, crop_selector, rows_state, output_sku_results],
     )
     sku_button.click(
-        process_image,
+        run_full_shelf_sku,
         inputs=[image_input, question_input],
         outputs=[output_image, output_summary, output_answer, crop_selector, rows_state, output_sku_results],
     )
