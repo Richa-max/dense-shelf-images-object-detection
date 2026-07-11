@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 try:
@@ -63,6 +64,8 @@ st.markdown(
 )
 
 PALETTE = px.colors.qualitative.Set3
+GRADIO_URL = os.getenv("GRADIO_URL", "http://localhost:7860")
+STREAMLIT_ANALYZE_ENABLED = os.getenv("STREAMLIT_ANALYZE_ENABLED", "1") == "1"
 
 
 SKU_COLUMNS = [
@@ -187,15 +190,25 @@ db.init_db()
 
 with st.sidebar:
     st.header("① Upload & detect")
-    if pipeline.classifier_ready():
-        st.success("SWIN+FAISS index loaded ✓")
-    else:
-        st.error("Classifier not ready — check retrieval/assets (see retrieval/README.md).")
+    st.info(
+        "For faster upload/result-table testing, run the Gradio app and use the "
+        "**Fast Upload** tab."
+    )
+    st.link_button("Open Fast Upload UI", GRADIO_URL, use_container_width=True)
 
-    uploaded = st.file_uploader("Shelf image", type=["jpg", "jpeg", "png", "bmp"])
-    conf = st.slider("YOLO confidence", 0.05, 0.9, 0.25, 0.05)
-    max_crops = st.slider("Max products to classify (0 = all)", 0, 300, 60, 10,
-                          help="Cap for speed on CPU. 0 classifies every detected box.")
+    if STREAMLIT_ANALYZE_ENABLED:
+        uploaded = st.file_uploader("Shelf image", type=["jpg", "jpeg", "png", "bmp"])
+        conf = st.slider("YOLO confidence", 0.05, 0.9, 0.25, 0.05)
+        max_crops = st.slider("Max products to classify (0 = all)", 0, 300, 60, 10,
+                              help="Cap for speed on CPU. 0 classifies every detected box.")
+    else:
+        uploaded = None
+        conf = 0.25
+        max_crops = 60
+        st.warning(
+            "Streamlit image analysis is disabled on this hosted demo. "
+            "Use Gradio/Fast Upload for upload + result table, then return here for analytics."
+        )
     st.divider()
     st.header("② SKU / OCR extraction")
     extract_sku = st.checkbox(
@@ -284,7 +297,7 @@ with st.sidebar:
     )
     save_to_db = st.checkbox("Save scan to inventory history", value=True)
     run = st.button("🔍 Analyze shelf", type="primary", use_container_width=True,
-                    disabled=uploaded is None)
+                    disabled=uploaded is None or not STREAMLIT_ANALYZE_ENABLED)
 
     st.divider()
     st.caption("Inventory history")
@@ -330,9 +343,23 @@ if run and uploaded is not None:
 result = st.session_state.get("result")
 records = st.session_state.get("records", [])
 
-tab_analyze, tab_analytics, tab_bi, tab_history = st.tabs(
-    ["🖼️ Detection", "📊 Analytics", "💬 Business Intelligence", "🗂️ Inventory History"]
+tab_fast_upload, tab_analyze, tab_analytics, tab_bi, tab_history = st.tabs(
+    [
+        "Fast Upload",
+        "Detection",
+        "Analytics",
+        "Business Intelligence",
+        "Inventory History",
+    ]
 )
+
+with tab_fast_upload:
+    st.subheader("Fast Upload UI")
+    st.caption(
+        "This embeds the Gradio app for upload, annotated image, and detections table. "
+        f"Start it with `python -m frontend.gradio_app` if the frame is empty. URL: `{GRADIO_URL}`"
+    )
+    components.iframe(GRADIO_URL, height=820, scrolling=True)
 
 with tab_analyze:
     if result is None:

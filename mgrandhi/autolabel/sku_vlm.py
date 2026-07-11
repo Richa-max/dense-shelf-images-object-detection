@@ -27,6 +27,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -368,9 +369,7 @@ class VertexModelGardenBackend(BaseBackend):
         started = time.time()
         url = self.predict_url()
         try:
-            token = subprocess.check_output(
-                ["gcloud", "auth", "print-access-token"], text=True, timeout=20
-            ).strip()
+            token = gcp_access_token()
             payload = {
                 "instances": [
                     {
@@ -414,6 +413,27 @@ class VertexModelGardenBackend(BaseBackend):
                 round(time.time() - started, 4),
                 f"{exc} url={url}",
             )
+
+
+def gcp_access_token() -> str:
+    """Return a Google OAuth token from gcloud or the GCE metadata server."""
+    gcloud = shutil.which("gcloud")
+    if gcloud:
+        return subprocess.check_output(
+            [gcloud, "auth", "print-access-token"], text=True, timeout=20
+        ).strip()
+
+    req = urllib_request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"},
+        method="GET",
+    )
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    token = data.get("access_token", "")
+    if not token:
+        raise RuntimeError("metadata server did not return access_token")
+    return token
 
 
 def image_to_base64(path: Path) -> str:
