@@ -36,9 +36,9 @@ except ImportError:
     def load_dotenv(*_args, **_kwargs):
         return False
 
-from backend import inventory_db as db
-from bi_interface import bi_engine
-from retrieval import pipeline
+from mgrandhi.backend import inventory_db as db
+from mgrandhi.bi_interface import bi_engine
+from mgrandhi.retrieval import pipeline
 
 load_dotenv()
 
@@ -94,7 +94,7 @@ def _style_fig(fig, height=380):
 @st.cache_resource(show_spinner=False)
 def _load_sku_backend(backend: str, model: str, endpoint: str, api_key: str,
                       project: str, location: str, timeout: int, dedicated_dns: str = ""):
-    from autolabel.sku_vlm import build_backend
+    from mgrandhi.autolabel.sku_vlm import build_backend
 
     args = SimpleNamespace(
         backend=backend,
@@ -126,7 +126,7 @@ def _empty_sku_fields() -> dict:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _list_openai_models(endpoint: str) -> list[str]:
-    from autolabel.sku_vlm import normalize_openai_base_url
+    from mgrandhi.autolabel.sku_vlm import normalize_openai_base_url
 
     if not endpoint:
         return []
@@ -140,7 +140,7 @@ def _list_openai_models(endpoint: str) -> list[str]:
 
 
 def _enrich_records_with_sku(records: list[dict], image: Image.Image, backend, max_sku_crops: int):
-    from autolabel.sku_vlm import coerce_bool
+    from mgrandhi.autolabel.sku_vlm import coerce_bool
 
     if not records:
         return records
@@ -254,7 +254,7 @@ with st.sidebar:
     )
     if extract_sku and sku_backend == "openai-compatible" and sku_endpoint:
         try:
-            from autolabel.sku_vlm import normalize_openai_base_url
+            from mgrandhi.autolabel.sku_vlm import normalize_openai_base_url
 
             resolved_endpoint = f"{normalize_openai_base_url(sku_endpoint)}/chat/completions"
             st.caption(f"Resolved chat endpoint: `{resolved_endpoint}`")

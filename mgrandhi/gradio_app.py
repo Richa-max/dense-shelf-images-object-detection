@@ -26,8 +26,8 @@ import gradio as gr
 import pandas as pd
 from PIL import Image
 
-from backend import inventory_db as db
-from retrieval import pipeline
+from mgrandhi.backend import inventory_db as db
+from mgrandhi.retrieval import pipeline
 
 DEFAULT_PORT = int(os.getenv("GRADIO_PORT", "7860"))
 DEFAULT_HOST = os.getenv("GRADIO_SERVER_NAME", "0.0.0.0")
