@@ -51,6 +51,19 @@ CREATE TABLE IF NOT EXISTS items (
 );
 CREATE INDEX IF NOT EXISTS idx_items_scan ON items(scan_id);
 CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
+CREATE TABLE IF NOT EXISTS inventory_stock (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_key TEXT NOT NULL UNIQUE,
+    match_type TEXT,
+    match_value TEXT,
+    category TEXT,
+    subcategory TEXT,
+    product_name TEXT,
+    barcode TEXT,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_stock_key ON inventory_stock(stock_key);
 """
 
 _ITEM_OPTIONAL_COLUMNS = {
@@ -85,6 +98,80 @@ def _ensure_item_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE items ADD COLUMN {name} {column_type}")
 
 
+def _clean(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def stock_identity(record: dict) -> dict:
+    barcode = _clean(record.get("barcode"))
+    product_name = _clean(record.get("product_name"))
+    sku_text = _clean(record.get("sku_text"))
+    category = _clean(record.get("category")) or "unknown"
+    subcategory = _clean(record.get("subcategory")) or "unknown"
+
+    if barcode:
+        match_type = "barcode"
+        match_value = barcode
+    elif product_name:
+        match_type = "product_name"
+        match_value = product_name.lower()
+    elif sku_text:
+        match_type = "sku_text"
+        match_value = sku_text.lower()
+    else:
+        match_type = "category_subcategory"
+        match_value = f"{category.lower()}::{subcategory.lower()}"
+
+    return {
+        "stock_key": f"{match_type}:{match_value}",
+        "match_type": match_type,
+        "match_value": match_value,
+        "category": category,
+        "subcategory": subcategory,
+        "product_name": product_name,
+        "barcode": barcode,
+    }
+
+
+def cart_key(record: dict) -> str:
+    crop_id = _clean(record.get("crop_id")) or "0"
+    return f"{crop_id}|{stock_identity(record)['stock_key']}"
+
+
+def _upsert_stock(conn: sqlite3.Connection, record: dict, quantity_delta: int) -> None:
+    if quantity_delta == 0:
+        return
+    ident = stock_identity(record)
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO inventory_stock (
+               stock_key, match_type, match_value, category, subcategory,
+               product_name, barcode, quantity, updated_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(stock_key) DO UPDATE SET
+               quantity = MAX(0, inventory_stock.quantity + excluded.quantity),
+               category = excluded.category,
+               subcategory = excluded.subcategory,
+               product_name = COALESCE(NULLIF(excluded.product_name, ''), inventory_stock.product_name),
+               barcode = COALESCE(NULLIF(excluded.barcode, ''), inventory_stock.barcode),
+               updated_at = excluded.updated_at""",
+        (
+            ident["stock_key"],
+            ident["match_type"],
+            ident["match_value"],
+            ident["category"],
+            ident["subcategory"],
+            ident["product_name"],
+            ident["barcode"],
+            int(quantity_delta),
+            now,
+        ),
+    )
+
+
 def save_scan(result, image_name: str, records: list[dict], db_path: str = DB_PATH) -> int:
     """Persist one analysis result. Returns the new scan id."""
     init_db(db_path)
@@ -110,7 +197,50 @@ def save_scan(result, image_name: str, records: list[dict], db_path: str = DB_PA
               r.get("visible_text"), r.get("package_size"), r.get("barcode"),
               r.get("sku_confidence"), r.get("sku_needs_review")) for r in records],
         )
+        for record in records:
+            _upsert_stock(conn, record, 1)
     return scan_id
+
+
+def checkout_items(cart: dict[str, int], records: list[dict], db_path: str = DB_PATH) -> dict:
+    init_db(db_path)
+    selected = {str(k): int(v) for k, v in cart.items() if int(v) > 0}
+    by_key = {cart_key(record): record for record in records}
+    grouped: dict[str, dict] = {}
+
+    for key, quantity in selected.items():
+        record = by_key.get(key)
+        if not record:
+            continue
+        ident = stock_identity(record)
+        stock_key = ident["stock_key"]
+        if stock_key not in grouped:
+            grouped[stock_key] = {"record": record, "quantity": 0, "identity": ident}
+        grouped[stock_key]["quantity"] += quantity
+
+    checked_out = []
+    short = []
+    with _connect(db_path) as conn:
+        for stock_key, entry in grouped.items():
+            quantity = int(entry["quantity"])
+            row = conn.execute(
+                "SELECT quantity FROM inventory_stock WHERE stock_key = ?",
+                (stock_key,),
+            ).fetchone()
+            available = int(row[0]) if row else 0
+            decrement = min(available, quantity)
+            if decrement:
+                _upsert_stock(conn, entry["record"], -decrement)
+                checked_out.append({**entry["identity"], "quantity": decrement})
+            if decrement < quantity:
+                short.append({**entry["identity"], "requested": quantity, "available": available})
+
+    return {
+        "requested": sum(selected.values()),
+        "checked_out": sum(item["quantity"] for item in checked_out),
+        "items": checked_out,
+        "short": short,
+    }
 
 
 def get_scans_df(db_path: str = DB_PATH) -> pd.DataFrame:
@@ -127,9 +257,20 @@ def get_items_df(scan_id: int | None = None, db_path: str = DB_PATH) -> pd.DataF
         return pd.read_sql_query("SELECT * FROM items WHERE scan_id = ?", conn, params=(scan_id,))
 
 
+def get_stock_df(db_path: str = DB_PATH) -> pd.DataFrame:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        return pd.read_sql_query(
+            """SELECT category, subcategory, product_name, barcode, quantity, updated_at
+               FROM inventory_stock
+               ORDER BY quantity DESC, category, subcategory""",
+            conn,
+        )
+
+
 def clear_all(db_path: str = DB_PATH) -> None:
     with _connect(db_path) as conn:
-        conn.executescript("DELETE FROM items; DELETE FROM scans;")
+        conn.executescript("DELETE FROM items; DELETE FROM scans; DELETE FROM inventory_stock;")
 
 
 def stats(db_path: str = DB_PATH) -> dict:
@@ -140,4 +281,5 @@ def stats(db_path: str = DB_PATH) -> dict:
         "total_scans": int(len(scans)),
         "total_items": int(len(items)),
         "distinct_categories": int(known["category"].nunique()) if not known.empty else 0,
+        "stock_units": int(get_stock_df(db_path=db_path)["quantity"].sum()),
     }
