@@ -20,7 +20,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # Ensure the repo root is importable when this file runs as a script.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import gradio as gr
 import pandas as pd
@@ -112,7 +112,7 @@ def _empty_sku_fields() -> dict:
 
 
 def _build_sku_backend(backend: str, model: str, endpoint: str):
-    from autolabel.sku_vlm import build_backend
+    from mgrandhi.autolabel.sku_vlm import build_backend
 
     args = SimpleNamespace(
         backend=backend,
@@ -135,7 +135,7 @@ def _enrich_records_with_sku(
     endpoint: str,
     max_sku_crops: int,
 ) -> tuple[list[dict], str]:
-    from autolabel.sku_vlm import coerce_bool
+    from mgrandhi.autolabel.sku_vlm import coerce_bool
 
     if not records:
         return records, "No detections to send to SKU/OCR."

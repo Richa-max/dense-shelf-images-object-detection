@@ -72,6 +72,30 @@ CREATE TABLE IF NOT EXISTS detected_items (
     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS detection_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_item_id INTEGER NOT NULL,
+    feedback_type TEXT NOT NULL CHECK (feedback_type IN ('category', 'sku')),
+    verdict TEXT NOT NULL CHECK (verdict IN ('correct', 'incorrect')),
+    correction TEXT,
+    note TEXT,
+    source_image_path TEXT,
+    crop_image_path TEXT,
+    bbox_x1 INTEGER,
+    bbox_y1 INTEGER,
+    bbox_x2 INTEGER,
+    bbox_y2 INTEGER,
+    predicted_category TEXT,
+    predicted_subcategory TEXT,
+    predicted_sku_text TEXT,
+    predicted_visible_text TEXT,
+    predicted_sku_confidence REAL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (detected_item_id) REFERENCES detected_items(id) ON DELETE CASCADE,
+    UNIQUE (detected_item_id, feedback_type)
+);
+
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL,
@@ -161,6 +185,10 @@ CREATE INDEX IF NOT EXISTS idx_shelf_scans_processed_at ON shelf_scans(processed
 CREATE INDEX IF NOT EXISTS idx_detected_items_scan ON detected_items(scan_id);
 CREATE INDEX IF NOT EXISTS idx_detected_items_product ON detected_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_detected_items_review_status ON detected_items(review_status);
+CREATE INDEX IF NOT EXISTS idx_detection_feedback_detection
+    ON detection_feedback(detected_item_id);
+CREATE INDEX IF NOT EXISTS idx_detection_feedback_verdict
+    ON detection_feedback(feedback_type, verdict);
 CREATE INDEX IF NOT EXISTS idx_inventory_snapshots_product_time
     ON inventory_snapshots(product_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_checkout_items_session ON checkout_items(checkout_session_id);

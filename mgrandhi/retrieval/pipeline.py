@@ -110,7 +110,7 @@ def _empty_label(pct: float) -> str:
 
 
 def analyze_image(image: Image.Image, conf: float = 0.25, max_crops: int = 0,
-                  pad: int = 12, top_k: int = 10) -> AnalysisResult:
+                  pad: int = 12, top_k: int = 10, progress_callback=None) -> AnalysisResult:
     """Detect + classify products on a shelf image. max_crops=0 classifies every box."""
     import time
 
@@ -135,9 +135,11 @@ def analyze_image(image: Image.Image, conf: float = 0.25, max_crops: int = 0,
     order = list(range(len(boxes)))
     if max_crops and max_crops > 0:
         order = order[:max_crops]
+    if progress_callback:
+        progress_callback("detected", len(boxes), len(order))
 
     detections: list[Detection] = []
-    for i in order:
+    for position, i in enumerate(order):
         x1, y1, x2, y2 = _pad_box(*boxes[i][:4], img_w, img_h, pad=pad)
         crop = image.crop((x1, y1, x2, y2))
         category, subcategory, score = "unknown", "unknown", 0.0
@@ -164,6 +166,8 @@ def analyze_image(image: Image.Image, conf: float = 0.25, max_crops: int = 0,
             subcategory=subcategory, score=round(score, 3),
             area=int((x2 - x1) * (y2 - y1)),
         ))
+        if progress_callback:
+            progress_callback("classified", position + 1, len(order))
 
     empty_pct = _estimate_empty_space(boxes, img_w, img_h)
     known = [d for d in detections if d.category != "unknown"]

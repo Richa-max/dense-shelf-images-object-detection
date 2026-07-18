@@ -22,6 +22,10 @@ flowchart LR
   Products --> CheckoutItems["checkout_items"]
   Inventory --> BI["Analytics and BI"]
   CheckoutItems --> BI
+  DetectedItems --> HumanFeedback["item_feedback"]
+  ShelfImage --> ReviewEvidence["data/review_evidence/scan_ID"]
+  CropImages --> ReviewEvidence
+  ReviewEvidence --> HumanFeedback
 ```
 
 ## Core Concepts
@@ -36,6 +40,8 @@ flowchart LR
 - **Checkout sessions/items**: automatic checkout header and line-item records.
 - **Model runs**: benchmark metadata so we can compare Qwen-VL, PaliGemma, Gemma 3, and Gemini
   reference runs without mixing outputs.
+- **Human feedback**: immutable prediction context plus an operator's category or SKU verdict and
+  optional correction, retained for later evaluation or retraining.
 
 ## Entity Relationship Summary
 
@@ -49,7 +55,53 @@ erDiagram
   model_runs ||--o{ model_predictions : produces
   checkout_sessions ||--o{ checkout_items : contains
   shelf_scans ||--o{ inventory_snapshots : produces
+  detected_items ||--o{ detection_feedback : reviewed_as
 ```
+
+## Operator UI Runtime Tables
+
+The React/FastAPI operator UI currently uses the compact SQLite tables in
+`backend/inventory_db.py`. They map to the expanded concepts below as follows:
+
+### `scans`
+
+One completed upload. In addition to scan KPIs, `image_name` preserves the client filename and
+`image_path` points to a normalized JPEG saved under
+`$FEEDBACK_ASSET_DIR/scan_<id>/source.jpg`. The default asset root is
+`data/review_evidence`; image bytes are deliberately kept out of SQLite.
+
+### `items`
+
+One retained detection per scan. `crop_id` identifies it within the scan, `box` contains the
+JSON-encoded `[x1, y1, x2, y2]` source-image coordinates, and `crop_path` points to
+`crop_<crop_id>.jpg`. The row also stores the category/subcategory, retrieval score, and the
+SKU/OCR prediction fields.
+
+### `item_feedback`
+
+One upserted operator verdict per `(scan_id, crop_id, feedback_type)`, where `feedback_type` is
+`category` or `sku`.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | integer pk | Feedback record id |
+| `scan_id`, `crop_id` | integer | Detection identity |
+| `feedback_type` | text | `category` or `sku` |
+| `verdict` | text | `correct` or `incorrect` |
+| `correction`, `note` | text | Optional operator correction and note |
+| `source_image_path`, `crop_image_path` | text | Review-evidence paths captured with the scan |
+| `box` | text | Snapshot of the source coordinates as JSON |
+| `predicted_category`, `predicted_subcategory` | text | Category prediction at review time |
+| `predicted_sku_text`, `predicted_visible_text` | text | SKU/OCR prediction at review time |
+| `predicted_sku_confidence` | real | SKU confidence at review time |
+| `ts` | text | Latest submission timestamp |
+
+Prediction and evidence fields are copied into the feedback row when a verdict is submitted. This
+keeps later exports reproducible even if the live item row is subsequently corrected. Existing
+SQLite files are migrated non-destructively by adding any missing optional columns during
+`init_db()`. Evidence paths are not returned by the public scan APIs. Deployments must place
+`FEEDBACK_ASSET_DIR` on persistent encrypted storage and apply an organization-approved retention
+policy because uploaded shelf images may contain people or other sensitive content.
 
 ## Tables
 
