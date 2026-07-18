@@ -10,9 +10,11 @@ import {
   Download,
   History,
   ImagePlus,
+  LayoutGrid,
   ListFilter,
   MessageCircleQuestion,
   PackageCheck,
+  Plus,
   RefreshCw,
   ScanLine,
   Search,
@@ -22,7 +24,9 @@ import {
   Store,
   ThumbsDown,
   ThumbsUp,
+  Trash2,
   Upload,
+  X,
 } from 'lucide-react'
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
 import {
@@ -39,8 +43,29 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { askInventory, getAnalysis, getHistory, getInsights, sendDetectionFeedback, startAnalysis } from './api'
-import type { AnalysisJob, Detection, Insights, ScanHistory, ScanResult } from './types'
+import {
+  askInventory,
+  createPlanogramTemplate,
+  getAnalysis,
+  getHistory,
+  getInsights,
+  getPlanogramTemplate,
+  getScanPlanogram,
+  listPlanogramTemplates,
+  sendDetectionFeedback,
+  startAnalysis,
+} from './api'
+import type {
+  AnalysisJob,
+  Detection,
+  Insights,
+  PlanogramResult,
+  PlanogramResultSlot,
+  PlanogramRow,
+  PlanogramTemplateSummary,
+  ScanHistory,
+  ScanResult,
+} from './types'
 import './App.css'
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -56,6 +81,7 @@ function Shell() {
         <nav aria-label="Main navigation">
           <NavLink to="/" end><Camera /><span>Scan shelf</span></NavLink>
           <NavLink to="/insights"><BarChart3 /><span>Insights</span></NavLink>
+          <NavLink to="/planogram"><LayoutGrid /><span>Planogram</span></NavLink>
           <NavLink to="/history"><History /><span>History</span></NavLink>
           <NavLink to="/ask"><MessageCircleQuestion /><span>Ask inventory</span></NavLink>
         </nav>
@@ -73,6 +99,7 @@ function Shell() {
           <Routes>
             <Route path="/" element={<ScanPage />} />
             <Route path="/insights" element={<InsightsPage />} />
+            <Route path="/planogram" element={<PlanogramPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/ask" element={<AskPage />} />
           </Routes>
@@ -614,6 +641,229 @@ function HistoryPage() {
         )) : <EmptyState copy="No scans yet. Start with a shelf photo." />}
       </div>}
     </>
+  )
+}
+
+const STATUS_LABEL: Record<PlanogramResultSlot['status'], string> = {
+  compliant: 'Compliant',
+  misplaced: 'Wrong product',
+  missing: 'Missing / gap',
+  extra: 'Unplanned item',
+}
+
+function labelFor(slot: PlanogramResultSlot) {
+  return slot.actual_key || slot.expected_key || '—'
+}
+
+function PlanogramPage() {
+  const [scans, setScans] = useState<ScanHistory[] | null>(null)
+  const [templates, setTemplates] = useState<PlanogramTemplateSummary[] | null>(null)
+  const [scanId, setScanId] = useState<number | null>(null)
+  const [templateId, setTemplateId] = useState<number | null>(null)
+  const [result, setResult] = useState<PlanogramResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [showBuilder, setShowBuilder] = useState(false)
+
+  const refreshTemplates = () => {
+    listPlanogramTemplates().then((payload) => setTemplates(payload.templates)).catch((reason) => setError(reason.message))
+  }
+
+  useEffect(() => {
+    getHistory().then((payload) => setScans(payload.scans)).catch((reason) => setError(reason.message))
+    refreshTemplates()
+  }, [])
+
+  const runComparison = () => {
+    if (!scanId || !templateId) return
+    setLoading(true)
+    setError('')
+    getScanPlanogram(scanId, templateId)
+      .then(setResult)
+      .catch((reason) => setError(reason.message))
+      .finally(() => setLoading(false))
+  }
+
+  return (
+    <>
+      <PageHeading
+        eyebrow="Shelf compliance"
+        title="Planogram check"
+        copy="Compare a scanned shelf against the layout it is supposed to have — by row and left-to-right position, not just totals."
+      />
+      {error && <div className="alert error"><AlertTriangle /> {error}</div>}
+
+      <div className="card planogram-controls">
+        <div className="planogram-selects">
+          <label>
+            <span>Shelf scan</span>
+            <select value={scanId ?? ''} onChange={(event) => setScanId(event.target.value ? Number(event.target.value) : null)}>
+              <option value="">Choose a scan…</option>
+              {scans?.map((scan) => (
+                <option value={scan.id} key={scan.id}>#{scan.id} · {scan.image_name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Target planogram</span>
+            <select value={templateId ?? ''} onChange={(event) => setTemplateId(event.target.value ? Number(event.target.value) : null)}>
+              <option value="">Choose a template…</option>
+              {templates?.map((template) => (
+                <option value={template.id} key={template.id}>{template.name}{template.shelf_id ? ` · ${template.shelf_id}` : ''}</option>
+              ))}
+            </select>
+          </label>
+          <button className="primary" onClick={runComparison} disabled={!scanId || !templateId || loading}>
+            {loading ? 'Comparing…' : 'Compare'} <ArrowRight />
+          </button>
+        </div>
+        <button className="secondary" onClick={() => setShowBuilder((value) => !value)}>
+          <Plus /> {showBuilder ? 'Close builder' : 'New template'}
+        </button>
+      </div>
+
+      {showBuilder && (
+        <TemplateBuilder
+          onCreated={() => {
+            setShowBuilder(false)
+            refreshTemplates()
+          }}
+        />
+      )}
+
+      {loading && <LoadingCard />}
+      {!loading && result && <PlanogramResults result={result} />}
+      {!loading && !result && !showBuilder && (
+        <EmptyState copy="Pick a scan and a target planogram, then compare to see row-by-row compliance." />
+      )}
+    </>
+  )
+}
+
+function PlanogramResults({ result }: { result: PlanogramResult }) {
+  const rows = new Map<number, PlanogramResultSlot[]>()
+  result.slots.forEach((slot) => {
+    const bucket = rows.get(slot.row_index) ?? []
+    bucket.push(slot)
+    rows.set(slot.row_index, bucket)
+  })
+  const orderedRows = [...rows.entries()].sort(([a], [b]) => a - b)
+
+  return (
+    <>
+      <div className="metrics-grid">
+        <Metric label="Compliance score" value={`${Math.round(result.compliance_score * 100)}%`} note="Of expected slots matched" tone={result.compliance_score < 0.7 ? 'warn' : 'good'} />
+        <Metric label="Compliant slots" value={result.total_compliant} note={`of ${result.total_expected} expected`} />
+        <Metric label="Missing / wrong" value={result.missing_count} note="Restock or correct" tone={result.missing_count ? 'warn' : 'good'} />
+        <Metric label="Unplanned items" value={result.extra_count} note="Not in this template" />
+      </div>
+
+      <div className="card planogram-grid-card">
+        <div className="section-title compact">
+          <span className="soft-icon green"><LayoutGrid /></span>
+          <div><h3>Row-by-row layout</h3><p>Top shelf first, left to right within each row.</p></div>
+        </div>
+        <div className="planogram-legend">
+          <span><i className="dot compliant" /> Compliant</span>
+          <span><i className="dot misplaced" /> Wrong product</span>
+          <span><i className="dot missing" /> Missing / gap</span>
+          <span><i className="dot extra" /> Unplanned item</span>
+        </div>
+        <div className="planogram-grid">
+          {orderedRows.map(([rowIndex, slots]) => (
+            <div className="planogram-row" key={rowIndex}>
+              <span className="planogram-row-label">Row {rowIndex + 1}</span>
+              <div className="planogram-row-slots">
+                {slots.sort((a, b) => a.position - b.position).map((slot, index) => (
+                  <div
+                    className={`planogram-slot slot-${slot.status}`}
+                    key={index}
+                    title={`${STATUS_LABEL[slot.status]}${slot.expected_key ? ` · expected: ${slot.expected_key}` : ''}${slot.actual_key ? ` · detected: ${slot.actual_key}` : ''}`}
+                  >
+                    <span className="planogram-slot-label">{labelFor(slot)}</span>
+                    <small>{STATUS_LABEL[slot.status]}</small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  )
+}
+
+type BuilderSlot = { slot_index: number; category: string; subcategory: string; brand: string; facings: number }
+type BuilderRow = { row_index: number; slots: BuilderSlot[] }
+
+function TemplateBuilder({ onCreated }: { onCreated: (templateId: number) => void }) {
+  const [name, setName] = useState('')
+  const [storeId, setStoreId] = useState('')
+  const [shelfId, setShelfId] = useState('')
+  const [rows, setRows] = useState<BuilderRow[]>([{ row_index: 0, slots: [{ slot_index: 0, category: '', subcategory: '', brand: '', facings: 1 }] }])
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const addRow = () => setRows((current) => [...current, { row_index: current.length, slots: [{ slot_index: 0, category: '', subcategory: '', brand: '', facings: 1 }] }])
+  const removeRow = (rowIndex: number) => setRows((current) => current.filter((row) => row.row_index !== rowIndex).map((row, index) => ({ ...row, row_index: index })))
+  const addSlot = (rowIndex: number) => setRows((current) => current.map((row) => row.row_index === rowIndex
+    ? { ...row, slots: [...row.slots, { slot_index: row.slots.length, category: '', subcategory: '', brand: '', facings: 1 }] }
+    : row))
+  const removeSlot = (rowIndex: number, slotIndex: number) => setRows((current) => current.map((row) => row.row_index === rowIndex
+    ? { ...row, slots: row.slots.filter((slot) => slot.slot_index !== slotIndex).map((slot, index) => ({ ...slot, slot_index: index })) }
+    : row))
+  const updateSlot = (rowIndex: number, slotIndex: number, patch: Partial<BuilderSlot>) => setRows((current) => current.map((row) => row.row_index === rowIndex
+    ? { ...row, slots: row.slots.map((slot) => slot.slot_index === slotIndex ? { ...slot, ...patch } : slot) }
+    : row))
+
+  const submit = () => {
+    if (!name.trim()) { setError('Give this planogram a name.'); return }
+    const hasContent = rows.some((row) => row.slots.some((slot) => slot.category.trim() || slot.brand.trim()))
+    if (!hasContent) { setError('Add at least one expected product to a slot.'); return }
+    setSaving(true)
+    setError('')
+    createPlanogramTemplate({ name, storeId, shelfId, rows: rows as PlanogramRow[] })
+      .then((payload) => onCreated(payload.template_id))
+      .catch((reason) => setError(reason.message))
+      .finally(() => setSaving(false))
+  }
+
+  return (
+    <div className="card template-builder">
+      <div className="section-title compact">
+        <span className="soft-icon green"><Sparkles /></span>
+        <div><h3>Define the target layout</h3><p>Describe each shelf row top to bottom, and what should sit in each spot, left to right.</p></div>
+      </div>
+      {error && <div className="alert error"><AlertTriangle /> {error}</div>}
+      <div className="builder-meta">
+        <label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Beverage aisle 3" /></label>
+        <label><span>Store ID</span><input value={storeId} onChange={(event) => setStoreId(event.target.value)} placeholder="store-014" /></label>
+        <label><span>Shelf ID</span><input value={shelfId} onChange={(event) => setShelfId(event.target.value)} placeholder="A3" /></label>
+      </div>
+      {rows.map((row) => (
+        <div className="builder-row" key={row.row_index}>
+          <div className="builder-row-head">
+            <strong>Row {row.row_index + 1}</strong>
+            {rows.length > 1 && <button className="icon-button" onClick={() => removeRow(row.row_index)}><Trash2 /></button>}
+          </div>
+          <div className="builder-slots">
+            {row.slots.map((slot) => (
+              <div className="builder-slot" key={slot.slot_index}>
+                <input placeholder="Category" value={slot.category} onChange={(event) => updateSlot(row.row_index, slot.slot_index, { category: event.target.value })} />
+                <input placeholder="Brand (optional)" value={slot.brand} onChange={(event) => updateSlot(row.row_index, slot.slot_index, { brand: event.target.value })} />
+                <input type="number" min={1} max={50} value={slot.facings} onChange={(event) => updateSlot(row.row_index, slot.slot_index, { facings: Number(event.target.value) || 1 })} title="Facings" />
+                {row.slots.length > 1 && <button className="icon-button" onClick={() => removeSlot(row.row_index, slot.slot_index)}><X /></button>}
+              </div>
+            ))}
+            <button className="secondary small" onClick={() => addSlot(row.row_index)}><Plus /> Add product</button>
+          </div>
+        </div>
+      ))}
+      <div className="builder-actions">
+        <button className="secondary" onClick={addRow}><Plus /> Add row</button>
+        <button className="primary" onClick={submit} disabled={saving}>{saving ? 'Saving…' : 'Save template'}</button>
+      </div>
+    </div>
   )
 }
 

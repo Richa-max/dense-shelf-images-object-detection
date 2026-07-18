@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -21,6 +22,8 @@ from pydantic import BaseModel, Field
 
 from mgrandhi.backend import analysis_service
 from mgrandhi.backend import inventory_db as db
+from mgrandhi.backend import planogram_db as pdb
+from mgrandhi.backend.planogram_engine import TemplateRow, TemplateSlot, compare_to_template
 from mgrandhi.bi_interface import bi_engine
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,26 @@ class QuestionResponse(BaseModel):
     text: str
     source: str
     table: list[dict[str, Any]] | None = None
+
+
+class PlanogramSlotRequest(BaseModel):
+    slot_index: int = Field(ge=0)
+    category: str = Field(default="", max_length=200)
+    subcategory: str = Field(default="", max_length=200)
+    brand: str = Field(default="", max_length=200)
+    facings: int = Field(default=1, ge=1, le=50)
+
+
+class PlanogramRowRequest(BaseModel):
+    row_index: int = Field(ge=0)
+    slots: list[PlanogramSlotRequest] = Field(default_factory=list)
+
+
+class PlanogramTemplateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    store_id: str = Field(default="", max_length=100)
+    shelf_id: str = Field(default="", max_length=100)
+    rows: list[PlanogramRowRequest] = Field(min_length=1)
 
 
 class FeedbackRequest(BaseModel):
@@ -294,6 +317,112 @@ def get_scan(scan_id: int) -> dict[str, Any]:
     return {
         "scan": _public_records(selected)[0],
         "items": _public_records(db.get_items_df(scan_id)),
+    }
+
+
+@app.post("/api/planogram/templates", status_code=201)
+def create_planogram_template(payload: PlanogramTemplateRequest) -> dict[str, Any]:
+    rows = [
+        TemplateRow(
+            row_index=row.row_index,
+            slots=[
+                TemplateSlot(
+                    slot_index=slot.slot_index,
+                    category=slot.category,
+                    subcategory=slot.subcategory,
+                    brand=slot.brand,
+                    facings=slot.facings,
+                )
+                for slot in row.slots
+            ],
+        )
+        for row in payload.rows
+    ]
+    template_id = pdb.save_template(
+        payload.name, rows, store_id=payload.store_id, shelf_id=payload.shelf_id
+    )
+    return {"template_id": template_id}
+
+
+@app.get("/api/planogram/templates")
+def list_planogram_templates() -> dict[str, Any]:
+    templates = pdb.list_templates()
+    return {"templates": _frame_records(templates)}
+
+
+@app.get("/api/planogram/templates/{template_id}")
+def get_planogram_template(template_id: int) -> dict[str, Any]:
+    rows = pdb.get_template(template_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="That planogram template could not be found.")
+    return {
+        "template_id": template_id,
+        "rows": [
+            {
+                "row_index": row.row_index,
+                "slots": [
+                    {
+                        "slot_index": slot.slot_index,
+                        "category": slot.category,
+                        "subcategory": slot.subcategory,
+                        "brand": slot.brand,
+                        "facings": slot.facings,
+                    }
+                    for slot in row.slots
+                ],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/scans/{scan_id}/planogram")
+def get_scan_planogram(scan_id: int, template_id: int) -> dict[str, Any]:
+    scans = db.get_scans_df()
+    if scans.empty or scans[scans["id"] == scan_id].empty:
+        raise HTTPException(status_code=404, detail="That saved scan could not be found.")
+
+    template_rows = pdb.get_template(template_id)
+    if template_rows is None:
+        raise HTTPException(status_code=404, detail="That planogram template could not be found.")
+
+    items = db.get_items_df(scan_id)
+    detections = [
+        {
+            "crop_id": int(row["crop_id"]),
+            "category": row["category"],
+            "subcategory": row["subcategory"],
+            "brand": row.get("brand") or "",
+            "product_name": row.get("product_name") or "",
+            "score": row["score"],
+            "box": json.loads(row["box"]) if isinstance(row["box"], str) else row["box"],
+        }
+        for row in items.to_dict("records")
+    ]
+    result = compare_to_template(detections, template_rows)
+    pdb.save_result(scan_id, template_id, result)
+
+    return {
+        "scan_id": scan_id,
+        "template_id": template_id,
+        "compliance_score": result.compliance_score,
+        "total_expected": result.total_expected,
+        "total_compliant": result.total_compliant,
+        "missing_count": result.missing_count,
+        "extra_count": result.extra_count,
+        "row_count_expected": result.row_count_expected,
+        "row_count_detected": result.row_count_detected,
+        "slots": [
+            {
+                "row_index": s.row_index,
+                "position": s.position,
+                "status": s.status,
+                "expected_key": s.expected_key,
+                "actual_key": s.actual_key,
+                "detail": s.detail,
+            }
+            for s in result.slots
+        ],
     }
 
 
