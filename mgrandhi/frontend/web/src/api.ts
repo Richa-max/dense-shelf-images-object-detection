@@ -1,4 +1,12 @@
-import type { AnalysisJob, Insights, ScanHistory } from './types'
+import type {
+  AnalysisJob,
+  Insights,
+  PlanogramResult,
+  PlanogramRow,
+  PlanogramTemplate,
+  PlanogramTemplateSummary,
+  ScanHistory,
+} from './types'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, options)
@@ -64,6 +72,38 @@ export function sendDetectionFeedback(payload: {
       correction: payload.correction || '',
     }),
   })
+}
+
+export function listPlanogramTemplates() {
+  return request<{ templates: PlanogramTemplateSummary[] }>('/api/planogram/templates')
+}
+
+export function getPlanogramTemplate(templateId: number) {
+  return request<PlanogramTemplate>(`/api/planogram/templates/${templateId}`)
+}
+
+export function createPlanogramTemplate(payload: {
+  name: string
+  storeId?: string
+  shelfId?: string
+  rows: PlanogramRow[]
+}) {
+  return request<{ template_id: number }>('/api/planogram/templates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: payload.name,
+      store_id: payload.storeId || '',
+      shelf_id: payload.shelfId || '',
+      rows: payload.rows,
+    }),
+  })
+}
+
+export function getScanPlanogram(scanId: number, templateId: number) {
+  return request<PlanogramResult>(
+    `/api/scans/${scanId}/planogram?template_id=${templateId}`,
+  )
 }
 
 export function askInventory(question: string) {
